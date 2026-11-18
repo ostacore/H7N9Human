@@ -1,0 +1,109 @@
+---
+title: "EDA"
+format: html
+editor: visual
+root.dir: "D:/BMC - Data Analysis Workshop in Immunology/H7N9Human"
+---
+
+```{r}
+# Working Directory
+knitr::opts_knit$set(root.dir = "D:/BMC - Data Analysis Workshop in Immunology/H7N9Human")
+```
+
+```{r}
+# Imports
+
+#install.packages("factoextra")
+library(ggplot2)
+library(factoextra)
+library(corrplot)
+```
+
+```{r}
+# Read dataset
+data = read.delim("../data/Project-H7N9Human.txt")
+```
+
+```{r}
+# Dataset content
+str(data)
+
+# Top 5 lines
+head(data, 5)
+
+# Last 5 lines
+tail(data, 5)
+
+# Types
+sapply(data, class)
+
+# View
+View(data)
+```
+
+```{r}
+# Gene variances
+
+# Compute the variance of each gene in the whole dataset
+gene_variances <- apply(data, 1, var)
+
+
+# 20 Genes with the highest variances
+head(sort(gene_variances, decreasing = TRUE), 20)
+```
+
+```{r}
+# Metadata extraction
+metadata <- data.frame(SampleID = colnames(data))
+metadata$Virus <- sapply(strsplit(metadata$SampleID, "_"), `[`, 1)
+metadata$Timepoint <- sapply(strsplit(metadata$SampleID, "_"), `[`, 2)
+metadata$Replicate <- sapply(strsplit(metadata$SampleID, "_"), `[`, 3)
+
+metadata$Group <- paste(metadata$Virus, metadata$Timepoint, sep = "_")
+
+View(metadata)
+```
+
+# EDA
+
+## Boxplots
+
+```{r}
+data_log <- log2(data + 1)
+
+# Boxplot
+boxplot(data_log, 
+        outline = FALSE, 
+        las = 2, 
+        cex.axis = 0.6, 
+        col = as.numeric(as.factor(metadata$Virus)),
+        main = "Gene expression distribution",
+        ylab = "Niveau d'expression (log2)")
+```
+
+## PCA
+
+```{r}
+pca_res <- prcomp(t(data), scale. = TRUE)
+
+fviz_pca_ind(pca_res,
+             geom = "point",
+             habillage = as.factor(metadata$Group),
+             addEllipses = FALSE,
+             pointsize = 2) +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+## Correlation matrix
+
+```{r}
+cor_matrix <- cor(data, method = "pearson")
+
+corrplot(cor_matrix, 
+         method = "color", 
+         type = "upper", 
+         tl.cex = 0.5, 
+         tl.col = "black", 
+         diag = FALSE)
+```
