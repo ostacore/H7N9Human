@@ -69,14 +69,21 @@ View(metadata)
 ## Boxplots
 
 ```{r}
+# Log2 du dataset
 data_log <- log2(data + 1)
+
+# Visuel
+## Marge
+par(mar = c(10, 4, 4, 2))
+## Couleurs
+couleurs_virus <- c("lightgray", "lightpink", "lightgreen", "lightblue", "cyan")
 
 # Boxplot
 boxplot(data_log, 
         outline = FALSE, 
         las = 2, 
         cex.axis = 0.6, 
-        col = as.numeric(as.factor(metadata$Virus)),
+        col = couleurs_virus[as.numeric(as.factor(metadata$Virus))],
         main = "Gene expression distribution",
         ylab = "Niveau d'expression (log2)")
 ```
@@ -84,13 +91,83 @@ boxplot(data_log,
 ## PCA
 
 ```{r}
-pca_res <- prcomp(t(data), scale. = TRUE)
+# Calculate principal components
+pca_res <- prcomp(t(data_log), scale. = FALSE)
 
+# Factoextra function to plot individuals from prcomp output
 fviz_pca_ind(pca_res,
              geom = "point",
-             habillage = as.factor(metadata$Group),
+             col.ind = metadata$Virus,
+             pointshape = metadata$Timepoint,
              addEllipses = FALSE,
+             palette = "jco",
              pointsize = 2) +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+## Principal components - Gene contributions
+
+```{r}
+# Top genes Dim 1
+fviz_contrib(pca_res, choice = "var", axes = 1, top = 100) +
+  labs(title = "Top genes contributing to Dim 1") +
+  theme_minimal()
+
+# Top genes Dim 2
+fviz_contrib(pca_res, choice = "var", axes = 2, top = 7) +
+  labs(title = "Top genes contributing to Dim 2") +
+  theme_minimal()
+```
+
+Genes most contributing to PCs (1 and 2).
+
+IFNB1 ?
+
+## Validating mock as control
+
+```{r}
+# Isolate mock samples from the normalized log2 data
+mock_cols <- grep("mock", colnames(data_log), value = TRUE)
+mock_data <- data_log[, mock_cols]
+
+# Compute correlation and visualize
+mock_cor <- cor(mock_data, method = "pearson")
+
+corrplot(mock_cor, 
+         method = "color", 
+         type = "upper", 
+         addCoef.col = "black", 
+         number.cex = 0.7, 
+         tl.col = "black",
+         diag = FALSE,
+         main = "Mock Samples Stability (Pearson Correlation)")
+```
+
+Mock samples present stable transcriptomic profiles. Good control.
+
+```{r}
+# Extract coordinates and merge with metadata
+pca_data <- as.data.frame(pca_res$x[, 1:2])
+pca_data$Virus <- metadata$Virus
+pca_data$Timepoint <- metadata$Timepoint
+
+# Calculate centroids for each condition
+centroids <- aggregate(cbind(PC1, PC2) ~ Virus + Timepoint, data = pca_data, FUN = mean)
+centroids <- centroids[order(centroids$Timepoint), ] 
+
+# Plot individuals with trajectory arrows
+ggplot(pca_data, aes(x = PC1, y = PC2, color = Virus)) +
+  geom_point(aes(shape = Timepoint), size = 3, alpha = 0.4) +
+  geom_path(data = centroids, 
+            aes(group = Virus), 
+            arrow = arrow(length = unit(0.15, "inches"), type = "closed"),
+            linewidth = 1) +
+  scale_color_manual(values = c("H3N2"="#377EB8", "H7N7"="#FF7F00", 
+                                "H7N9"="#984EA3", "mock"="#E41A1C", 
+                                "VN1203"="#4DAF4A")) +
+  labs(title = "Viral Transcriptomic Trajectories Over Time",
+       x = "Dim 1", y = "Dim 2") +
   theme_minimal() +
   theme(legend.position = "right")
 ```
