@@ -1,0 +1,308 @@
+---
+title: "H7N9_analysis"
+format: html
+editor: visual
+---
+
+<!-- Version reconstruite à partir de l'historique RStudio (exécution du 18/11 à 22h44). -->
+
+## Organize the project
+
+```{r}
+# install.packages("tidyr")
+# install.packages(c("ggplot2", "pheatmap", "ggVennDiagram", "enrichR", "dplyr"))
+library(ggplot2); library(pheatmap); library(ggVennDiagram); library(enrichR); library(dplyr)
+```
+
+# Import data
+
+```{r}
+# Raw data
+expr <- read.delim("/Users/axelcypres/Google Drive/My Drive/M2 BMC ITSI/DATA ANALYSIS IN IMMUNOLOGY/PROJECT/01_data/Project-H7N9Human.txt",
+                   row.names = 1, check.names = FALSE)
+expr <- as.matrix(expr)
+dim(expr)
+summary(as.numeric(expr))
+
+# Log2
+logexpr <- log2(expr + 1)
+range(logexpr)
+
+# Metadata
+meta <- data.frame(sample = colnames(expr))
+parts <- strsplit(meta$sample, "_")
+meta$virus     <- sapply(parts, `[`, 1)
+meta$time      <- sapply(parts, `[`, 2)
+meta$replicate <- sapply(parts, `[`, 3)
+table(meta$virus, meta$time)   # replicats number
+
+# variables
+mock_name <- "mock"
+viruses   <- c("H7N9", "H7N7", "H3N2", "VN1203")
+times     <- c("03h", "07h", "12h", "24h")
+```
+
+# Boxplot and PCA
+
+```{r}
+# virus colors
+virus_list <- unique(meta$virus)
+cols_virus <- setNames(rainbow(length(virus_list)), virus_list)
+
+boxplot(logexpr, las = 2, cex.axis = 0.5, outline = FALSE,
+        col = cols_virus[meta$virus],
+        main = "Sample distribution")
+legend("bottomright", legend = names(cols_virus), fill = cols_virus,
+       cex = 0.7, bg = "white")
+
+mds <- cmdscale(dist(t(logexpr)))
+df <- data.frame(mds, meta)
+ggplot(df, aes(X1, X2, color = virus, shape = factor(time))) + geom_point(size = 3)
+```
+
+# Differential expression
+
+```{r}
+de_test <- function(virus, time) {
+  if (max(logexpr) > 30) stop("Les données ne sont pas en log2 !")
+  inf  <- logexpr[, meta$virus == virus     & meta$time == time, drop = FALSE]
+  mock <- logexpr[, meta$virus == mock_name & meta$time == time, drop = FALSE]
+  n1 <- ncol(inf); n2 <- ncol(mock)
+  cat(virus, time, ":", n1, "infected vs", n2, "mock\n")
+  if (n1 < 2 | n2 < 2) stop("Pas assez d'échantillons pour ", virus, " ", time)
+
+  m1 <- rowMeans(inf); m2 <- rowMeans(mock)
+  v1 <- rowSums((inf  - m1)^2) / (n1 - 1)
+  v2 <- rowSums((mock - m2)^2) / (n2 - 1)
+  sp2   <- ((n1 - 1) * v1 + (n2 - 1) * v2) / (n1 + n2 - 2)
+  tstat <- (m1 - m2) / sqrt(sp2 * (1 / n1 + 1 / n2))
+  pval  <- 2 * pt(-abs(tstat), df = n1 + n2 - 2)
+
+  data.frame(gene   = rownames(logexpr),
+             log2FC = m1 - m2,
+             pval   = pval,
+             padj   = p.adjust(pval, method = "BH"))
+}
+
+res <- list()
+for (v in viruses) for (t in times) {
+  nm <- paste(v, t, sep = "_")
+  res[[nm]] <- de_test(v, t)
+}
+
+# Seuils (à justifier dans le rapport)
+FC_cut <- 1      # |log2FC| > 1  = fold change > 2
+P_cut  <- 0.05
+range(res$H7N9_24h$log2FC)
+```
+
+# DEG by virus and time
+
+```{r}
+is_deg <- function(d) !is.na(d$pval) & abs(d$log2FC) > FC_cut & d$pval < P_cut
+deg <- lapply(res, function(d) d$gene[is_deg(d)])
+
+counts <- data.frame(
+  comp = names(res),
+  up   = sapply(res, function(d) sum(is_deg(d) & d$log2FC > 0)),
+  down = sapply(res, function(d) sum(is_deg(d) & d$log2FC < 0))
+)
+counts$virus <- sapply(strsplit(counts$comp, "_"), `[`, 1)
+counts$time  <- sapply(strsplit(counts$comp, "_"), `[`, 2)
+counts$total <- counts$up + counts$down
+print(counts)
+write.csv(counts, "cc", row.names = FALSE)
+
+p_counts <- ggplot(counts, aes(time, total, fill = virus)) +
+  geom_col(position = "dodge") +
+  theme_bw() +
+  labs(x = "post-infection time", y = "DEG number",
+       title = paste0("DEG (|log2FC| > ", FC_cut,
+                      ", p < ", P_cut, ")"))
+print(p_counts)
+ggsave("figures/03_nombre_DEG.png", p_counts, width = 7, height = 5)
+
+# Version up / down separed
+counts_long <- rbind(
+  data.frame(counts[, c("virus", "time")], sens = "up",   n =  counts$up),
+  data.frame(counts[, c("virus", "time")], sens = "down", n = -counts$down)
+)
+p_updown <- ggplot(counts_long, aes(time, n, fill = virus)) +
+  geom_col(position = "dodge") +
+  geom_hline(yintercept = 0) +
+  theme_bw() +
+  labs(x = "Post-infection time", y = "DEG number (up > 0, down < 0)",
+       title = "DEG up and down")
+print(p_updown)
+ggsave("figures/04_DEG_up_down.png", p_updown, width = 7, height = 5)
+```
+
+# Volcano plots (all viruses)
+
+```{r}
+library(ggrepel)
+
+volcano <- function(virus, time, n_labels = 10) {
+  d <- res[[paste(virus, time, sep = "_")]]
+  d$statut <- "NS"
+  d$statut[is_deg(d) & d$log2FC > 0] <- "Up"
+  d$statut[is_deg(d) & d$log2FC < 0] <- "Down"
+  n_up <- sum(d$statut == "Up"); n_down <- sum(d$statut == "Down")
+  d$statut <- factor(d$statut, levels = c("Up", "Down", "NS"),
+                     labels = c(paste0("Up (", n_up, ")"), paste0("Down (", n_down, ")"), "NS"))
+
+  # Colours (Up = red, Down = blue, NS = grey)
+  cols <- setNames(c("red", "blue", "grey70"), levels(d$statut))
+
+  top <- head(d[d$statut != "NS", ][order(d$pval[d$statut != "NS"]), ], n_labels)
+
+  ggplot(d, aes(log2FC, -log10(pval), color = statut)) +
+    geom_point(size = 1.2, alpha = 0.8) +
+    geom_vline(xintercept = c(-FC_cut, FC_cut), linetype = "dashed", color = "black", linewidth = 0.4) +
+    geom_hline(yintercept = -log10(P_cut), linetype = "dashed", color = "black", linewidth = 0.4) +
+    geom_text_repel(data = top, aes(label = gene), color = "black", size = 3,
+                    max.overlaps = 30, box.padding = 0.5, show.legend = FALSE) +
+    scale_color_manual(values = cols, name = NULL, drop = FALSE) +
+    theme_bw(base_size = 13) +
+    theme(panel.grid = element_blank(),
+          legend.position = "top",
+          plot.title = element_text(hjust = 0.5, face = "bold")) +
+    labs(title = paste0(virus, " vs Mock (", time, ")"),
+         x = expression(log[2]~"Fold Change"), y = expression(-log[10]~italic(p)*"-value")) +
+    # the same axes for all volcanoes -> allowing for comparison between viruses and over time
+    coord_cartesian(xlim = x_lim, ylim = y_lim)
+}
+
+# Common axis limits, calculated from the 16 comparisons
+x_lim <- range(sapply(res, function(d) range(d$log2FC, na.rm = TRUE)))
+y_lim <- c(0, max(sapply(res, function(d) max(-log10(d$pval), na.rm = TRUE))))
+
+# One volcano per virus and per time point (4 viruses x 4 time points = 16 figures)
+for (v in viruses) {
+  for (t in times) {
+    p <- volcano(v, t)
+    print(p)
+    ggsave(paste0("figures/05_volcano_", v, "_", t, ".png"), p, width = 6, height = 5.5, dpi = 300)
+  }
+}
+```
+
+# Heatmaps : Is one virus different from the others?
+
+Three complementary heatmaps, with hierarchical clustering of the columns. If a virus stands out, its columns form a separate branch of the dendrogram.
+
+1.  **Samples, one time point at a time**: z-score per gene, UP and DOWN genes kept in separate blocks.
+2.  **log2FC of the 16 comparisons**: no z-score, because the sign and magnitude of the log2FC are meaningful.
+3.  **Correlation between the 16 signatures**: Pearson correlation of the log2FC values.
+
+```{r}
+library(pheatmap)
+
+# save in png
+save_ph <- function(ph, file, width = 8, height = 8) {
+  png(file, width = width, height = height, units = "in", res = 300)
+  grid::grid.newpage(); grid::grid.draw(ph$gtable)
+  dev.off()
+}
+
+# Colours : red = UP, blue = DOWN, white = 0
+pal <- colorRampPalette(c("blue", "white", "red"))(100)
+
+# Colours (virus and time)
+ann_colors <- list(
+  virus = cols_virus,
+  time  = setNames(c("#EEEEEE", "#BBBBBB", "#777777", "#333333"), times)
+)
+
+n_top <- 1000   # Maximum number of genes displayed (the most variable ones) for readability
+```
+
+```{r}
+# --- 1. Heatmap of samples, one time point at a time -------------------------
+# Rows = DEG (detected in at least one virus at this time point), columns = samples from this time point (including mock)
+# Values = z-score per gene: (expression - mean for the gene) / standard deviation
+#   -> we compare the PROFILES of the genes across samples, not their absolute levels
+for (t in times) {
+  genes_t <- unique(unlist(deg[paste0(viruses, "_", t)]))
+  samp_t  <- meta$sample[meta$time == t]
+  mat <- logexpr[genes_t, samp_t]
+  mat <- mat[apply(mat, 1, var) > 0, ]                       # removes constant genes
+  mat <- mat[head(order(apply(mat, 1, var), decreasing = TRUE), n_top), ]
+  z   <- t(scale(t(mat)))                                    # z-score BY GENE (per row)
+
+  # Gene direction = sign of its average log2FC across the 4 viruses at this time point
+  #   average > 0 -> UP (upregulated by infection), average < 0 -> DOWN
+  lfc_t <- sapply(viruses, function(v) {
+    r <- res[[paste(v, t, sep = "_")]]
+    r$log2FC[match(rownames(z), r$gene)]
+  })
+  up_t <- rownames(z)[rowMeans(lfc_t) >  0]
+  dn_t <- rownames(z)[rowMeans(lfc_t) <= 0]
+
+  # We organise the genes: the UP block at the top, the DOWN block at the bottom.
+  # Within each block, we group together genes with similar profiles
+  # (without ever moving a gene from one block to the other)
+  clust_block <- function(g) if (length(g) > 2) g[hclust(dist(z[g, ]))$order] else g
+  z <- z[c(clust_block(up_t), clust_block(dn_t)), ]
+
+  ann     <- data.frame(virus = meta$virus[meta$time == t], row.names = samp_t)
+  ann_row <- data.frame(Sens = rep(c("UP", "DOWN"), c(length(up_t), length(dn_t))),
+                        row.names = rownames(z))
+
+  ph <- pheatmap(z, color = pal, breaks = seq(-3, 3, length.out = 101),
+                 cluster_cols = TRUE,
+                 cluster_rows = FALSE,             # keep the order: UP at the top, DOWN at the bottom
+                 gaps_row = length(up_t),          # white line between UP and DOWN
+                 show_rownames = FALSE, annotation_col = ann,
+                 annotation_row = ann_row,         # UP / DOWN on the left
+                 annotation_colors = c(ann_colors["virus"],
+                                       list(Sens = c(UP = "red", DOWN = "blue"))),
+                 main = paste0("Samples at ", t, " - ", length(up_t), " UP / ",
+                               length(dn_t), " DOWN (z-score)"))
+  save_ph(ph, paste0("figures/06_heatmap_samples_", t, ".png"), width = 8, height = 7)
+}
+```
+
+```{r}
+# --- 2. Heatmap of log2FC values for the 16 comparisons --------------------------------
+# Rows = DEGs in at least one comparison; columns = virus_time
+# Values = log2FC vs mock (no z-score: the sign and magnitude are meaningful)
+lfc <- sapply(res, function(d) d$log2FC)
+rownames(lfc) <- res[[1]]$gene
+all_deg <- unique(unlist(deg))
+lfc_deg <- lfc[all_deg, ]
+lfc_deg <- lfc_deg[head(order(apply(lfc_deg, 1, var), decreasing = TRUE), n_top), ]
+
+ann_comp <- data.frame(virus = sub("_.*", "", colnames(lfc)),
+                       time  = sub(".*_", "", colnames(lfc)),
+                       row.names = colnames(lfc))
+
+ph_lfc <- pheatmap(lfc_deg, color = pal, breaks = seq(-4, 4, length.out = 101),
+                   cluster_cols = TRUE, cluster_rows = TRUE,
+                   show_rownames = FALSE, annotation_col = ann_comp,
+                   annotation_colors = ann_colors,
+                   main = paste0("log2FC vs mock - ", nrow(lfc_deg), " the most variable genes"))
+save_ph(ph_lfc, "figures/07_heatmap_log2FC_all.png", width = 9, height = 9)
+```
+
+```{r}
+# --- 3. Correlation between the 16 signatures -----------------------------------
+# Pearson's correlation of log2FC values (across all DEGs)
+# Close to 1 = both viruses modulate the same genes in the same direction
+cor_lfc <- cor(lfc[all_deg, ], method = "pearson")
+
+ph_cor <- pheatmap(cor_lfc, color = colorRampPalette(c("white", "#FDB863", "#B2182B"))(100),
+                   breaks = seq(0, 1, length.out = 101),
+                   cluster_cols = TRUE, cluster_rows = TRUE,
+                   display_numbers = TRUE, number_format = "%.2f", fontsize_number = 7,
+                   annotation_col = ann_comp, annotation_row = ann_comp,
+                   annotation_colors = ann_colors,
+                   main = "Correlation of log2FC values across comparisons")
+save_ph(ph_cor, "figures/08_heatmap_correlation.png", width = 10, height = 9)
+
+# Table: Correlation between H7N9 and each other virus, at the same time
+cor_h7n9 <- sapply(times, function(t)
+  sapply(setdiff(viruses, "H7N9"), function(v)
+    cor_lfc[paste0("H7N9_", t), paste0(v, "_", t)]))
+round(cor_h7n9, 2)
+```

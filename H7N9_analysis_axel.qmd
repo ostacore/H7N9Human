@@ -360,6 +360,12 @@ write.table(unique_down_H7N9, file = file.path(output_dir, "H7N9_exclusive_DOWN.
 
 ```
 
+## All viruses dyregulated genes
+
+```{r}
+
+```
+
 ### ReactomePA
 
 ```{r}
@@ -487,4 +493,61 @@ volcano_H7N9
 plot_volcano(deg_H3N2, "H3N2")
 plot_volcano(deg_H7N7, "H7N7")
 plot_volcano(deg_VN1203, "VN1203")
+```
+
+## Volcano plots par temps (H7N9)
+
+```{r}
+# ---- Volcano plots par temps (bloc autonome) ----
+
+times   <- c("03h", "07h", "12h", "24h")
+viruses <- c("H7N9", "H7N7", "H3N2", "VN1203")
+FC_cut  <- 1
+P_cut   <- 0.05
+
+# t-test de Student vectorise : virus_temps vs mock_meme temps (sur data_log)
+de_test <- function(virus, time) {
+  x <- as.matrix(data_log[, metadata$Virus == virus & metadata$Timepoint == time])
+  y <- as.matrix(data_log[, metadata$Virus == "mock" & metadata$Timepoint == time])
+  n1 <- ncol(x); n2 <- ncol(y)
+  m1 <- rowMeans(x); m2 <- rowMeans(y)
+  v1 <- apply(x, 1, var); v2 <- apply(y, 1, var)
+  sp <- ((n1 - 1) * v1 + (n2 - 1) * v2) / (n1 + n2 - 2)
+  tt <- (m1 - m2) / sqrt(sp * (1 / n1 + 1 / n2))
+  p  <- 2 * pt(-abs(tt), df = n1 + n2 - 2)
+  data.frame(gene = rownames(data_log), log2FC = m1 - m2, pval = p,
+             padj = p.adjust(p, "BH"))
+}
+
+res <- list()
+for (v in viruses) for (t in times) res[[paste(v, t, sep = "_")]] <- de_test(v, t)
+
+is_deg <- function(d) !is.na(d$pval) & abs(d$log2FC) > FC_cut & d$pval < P_cut
+
+volcano <- function(virus, time, n_lab = 10) {
+  d <- res[[paste(virus, time, sep = "_")]]
+  d <- d[!is.na(d$pval), ]
+  d$statut <- factor(ifelse(is_deg(d) & d$log2FC > 0, "UP",
+                     ifelse(is_deg(d), "DOWN", "NS")), levels = c("UP", "DOWN", "NS"))
+  lab <- head(d[is_deg(d), ][order(d$pval[is_deg(d)]), ], n_lab)
+  ggplot(d, aes(log2FC, -log10(pval), color = statut)) +
+    geom_point(alpha = 0.5, size = 1) +
+    scale_color_manual(values = c(UP = "#D62728", DOWN = "#1F77B4", NS = "grey70"),
+                       drop = FALSE, name = NULL) +
+    geom_vline(xintercept = c(-FC_cut, FC_cut), linetype = "dashed") +
+    geom_hline(yintercept = -log10(P_cut), linetype = "dashed") +
+    geom_text_repel(data = lab, aes(label = gene), color = "black", size = 3) +
+    labs(title = paste0(virus, " vs mock - ", time),
+         subtitle = paste0(sum(d$statut == "UP"), " UP / ", sum(d$statut == "DOWN"), " DOWN"),
+         x = "log2 Fold Change", y = "-log10(p-value)") +
+    theme_minimal()
+}
+
+# Un volcano par temps pour H7N9
+dir.create("figures", showWarnings = FALSE)
+for (t in times) {
+  p <- volcano("H7N9", t)
+  print(p)
+  ggsave(paste0("figures/volcano_H7N9_", t, ".png"), p, width = 6, height = 5.5, dpi = 300)
+}
 ```
