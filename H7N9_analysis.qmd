@@ -1,0 +1,496 @@
+---
+title: "EDA"
+format: html
+editor: visual
+root.dir: "D:/BMC - Data Analysis Workshop in Immunology/H7N9Human"
+---
+
+```{r}
+# Working Directory
+knitr::opts_knit$set(root.dir = "/Users/axelcypres/Google Drive/My Drive/M2 BMC ITSI/DATA ANALYSIS IN IMMUNOLOGY/PROJECT/01_data/")
+```
+
+```{r}
+# Only run once if not installed ; uncomment and run
+#install.packages("factoextra")
+#install.packages("ggVennDiagram")
+#install.packages("ggrepel")
+#install.packages("pheatmap")
+#if (!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+#BiocManager::install(c("clusterProfiler", "org.Hs.eg.db", "ReactomePA"))
+#install.packages("enrichR")
+
+# Imports
+library(enrichR)
+library(pheatmap)
+library(ggrepel)
+library(ggVennDiagram)
+library(ggplot2)
+library(factoextra)
+library(corrplot)
+
+```
+
+```{r}
+# Read dataset
+data = read.delim("/Users/axelcypres/Google Drive/My Drive/M2 BMC ITSI/DATA ANALYSIS IN IMMUNOLOGY/PROJECT/01_data/Project-H7N9Human.txt")
+```
+
+```{r}
+# Dataset content
+str(data)
+
+# Top 5 lines
+head(data, 5)
+
+# Last 5 lines
+tail(data, 5)
+
+# Types
+sapply(data, class)
+
+# View
+View(data)
+```
+
+```{r}
+# Gene variances
+
+# Compute the variance of each gene in the whole dataset
+gene_variances <- apply(data, 1, var)
+
+
+# 20 Genes with the highest variances
+head(sort(gene_variances, decreasing = TRUE), 20)
+```
+
+```{r}
+# Metadata extraction
+metadata <- data.frame(SampleID = colnames(data))
+metadata$Virus <- sapply(strsplit(metadata$SampleID, "_"), `[`, 1)
+metadata$Timepoint <- sapply(strsplit(metadata$SampleID, "_"), `[`, 2)
+metadata$Replicate <- sapply(strsplit(metadata$SampleID, "_"), `[`, 3)
+
+metadata$Group <- paste(metadata$Virus, metadata$Timepoint, sep = "_")
+
+View(metadata)
+```
+
+# EDA
+
+## Boxplots
+
+```{r}
+# Log2 du dataset
+data_log <- log2(data + 1)
+
+# Visuel
+## Marge
+par(mar = c(10, 4, 4, 2))
+## Couleurs
+couleurs_virus <- c("lightgray", "lightpink", "lightgreen", "lightblue", "cyan")
+
+# Boxplot
+boxplot(data_log, 
+        outline = FALSE, 
+        las = 2, 
+        cex.axis = 0.6, 
+        col = couleurs_virus[as.numeric(as.factor(metadata$Virus))],
+        main = "Gene expression distribution",
+        ylab = "Niveau d'expression (log2)")
+```
+
+## PCA
+
+```{r}
+# Calculate principal components
+pca_res <- prcomp(t(data_log), scale. = FALSE)
+
+# Factoextra function to plot individuals from prcomp output
+fviz_pca_ind(pca_res,
+             geom = "point",
+             col.ind = metadata$Virus,
+             pointshape = metadata$Timepoint,
+             addEllipses = FALSE,
+             palette = "jco",
+             pointsize = 2) +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+## Viral trajectories
+
+```{r}
+# Extract coordinates and merge with metadata
+pca_data <- as.data.frame(pca_res$x[, 1:2])
+pca_data$Virus <- metadata$Virus
+pca_data$Timepoint <- metadata$Timepoint
+
+# Calculate centroids for each condition
+centroids <- aggregate(cbind(PC1, PC2) ~ Virus + Timepoint, data = pca_data, FUN = mean)
+centroids <- centroids[order(centroids$Timepoint), ] 
+
+# Plot individuals with trajectory arrows
+ggplot(pca_data, aes(x = PC1, y = PC2, color = Virus)) +
+  geom_point(aes(shape = Timepoint), size = 3, alpha = 0.4) +
+  geom_path(data = centroids, 
+            aes(group = Virus), 
+            arrow = arrow(length = unit(0.15, "inches"), type = "closed"),
+            linewidth = 1) +
+  scale_color_manual(values = c("H3N2"="#377EB8", "H7N7"="#FF7F00", 
+                                "H7N9"="#984EA3", "mock"="#E41A1C", 
+                                "VN1203"="#4DAF4A")) +
+  labs(title = "Viral Transcriptomic Trajectories Over Time",
+       x = "Dim 1", y = "Dim 2") +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+## Principal components - Gene contributions
+
+```{r}
+# Top genes Dim 1
+fviz_contrib(pca_res, choice = "var", axes = 1, top = 7) +
+  labs(title = "Top genes contributing to Dim 1") +
+  theme_minimal()
+
+# Top genes Dim 2
+fviz_contrib(pca_res, choice = "var", axes = 2, top = 7) +
+  labs(title = "Top genes contributing to Dim 2") +
+  theme_minimal()
+```
+
+Genes most contributing to PCs (1 and 2).
+
+IFNB1 ?
+
+## Validating mock as control
+
+```{r}
+# Isolate mock samples from the normalized log2 data
+mock_cols <- grep("mock", colnames(data_log), value = TRUE)
+mock_data <- data_log[, mock_cols]
+
+# Compute correlation and visualize
+mock_cor <- cor(mock_data, method = "pearson")
+
+corrplot(mock_cor, 
+         method = "color", 
+         type = "upper", 
+         addCoef.col = "black", 
+         number.cex = 0.7, 
+         tl.col = "black",
+         diag = FALSE,
+         main = "Mock Samples Stability (Pearson Correlation)")
+```
+
+Mock samples present stable transcriptomic profiles. Good control.
+
+# DEGs
+
+## T-Test Function
+
+```{r}
+# Function to calculate Fold Change and P-value for a specific virus at 24h vs Mock 24h
+run_deg_analysis <- function(data_matrix, target_virus) {
+  
+  # Identify column indices for the target virus and the mock control at 24h
+  idx_virus <- grep(paste0("^", target_virus, "_24h"), colnames(data_matrix))
+  idx_mock <- grep("^mock_24h", colnames(data_matrix))
+  
+  # Apply t-test row by row (gene by gene)
+  results <- t(apply(data_matrix, 1, function(gene_expr) {
+    expr_virus <- gene_expr[idx_virus]
+    expr_mock <- gene_expr[idx_mock]
+    
+    # Calculate log2 Fold Change (mean of virus minus mean of mock)
+    # Since data is already log2 transformed: log2(A) - log2(B) = log2(A/B)
+    logFC <- mean(expr_virus) - mean(expr_mock)
+    
+    # Run t-test (suppress errors if variance is 0)
+    p_val <- tryCatch(
+      t.test(expr_virus, expr_mock, var.equal = TRUE)$p.value,
+      error = function(e) NA
+    )
+    
+    return(c(logFC = logFC, pvalue = p_val))
+  }))
+  
+  # Convert to dataframe
+  res_df <- as.data.frame(results)
+  res_df$Gene <- rownames(res_df)
+  
+  # Apply Multiple Testing Correction (Benjamini-Hochberg FDR)
+  res_df$padj <- p.adjust(res_df$pvalue, method = "BH")
+  
+  return(res_df)
+}
+```
+
+## Run T-Tests for each virus
+
+```{r}
+# Run the analysis for each virus vs Mock at 24h
+deg_H7N9 <- run_deg_analysis(data_log, "H7N9")
+deg_H3N2 <- run_deg_analysis(data_log, "H3N2")
+deg_H7N7 <- run_deg_analysis(data_log, "H7N7")
+deg_VN1203 <- run_deg_analysis(data_log, "VN1203")
+
+# Check the top most significant genes for H7N9
+head(deg_H7N9[order(deg_H7N9$padj), ])
+```
+
+## Significant dysregulated genes
+
+```{r}
+# Count how many DEGs each virus triggered at 24h, up or downregulated by more than double or half
+sig_threshold <- function(df) {
+  sum(df$padj < 0.05 & abs(df$logFC) > 1, na.rm = TRUE)
+}
+
+cat("Significant DEGs at 24h:\n",
+    "H7N9: ", sig_threshold(deg_H7N9), "\n",
+    "H3N2: ", sig_threshold(deg_H3N2), "\n",
+    "H7N7: ", sig_threshold(deg_H7N7), "\n",
+    "VN1203: ", sig_threshold(deg_VN1203), "\n")
+```
+
+## Venn Diagrams for DEGs
+
+```{r}
+# Extract significant upregulated and downregulated genes
+get_up_genes <- function(df) df[which(df$padj < 0.05 & df$logFC > 1), "Gene"]
+get_down_genes <- function(df) df[which(df$padj < 0.05 & df$logFC < -1), "Gene"]
+
+list_UP <- list(
+  H3N2   = get_up_genes(deg_H3N2),
+  H7N7   = get_up_genes(deg_H7N7),
+  H7N9   = get_up_genes(deg_H7N9),
+  VN1203 = get_up_genes(deg_VN1203)
+)
+
+list_DOWN <- list(
+  H3N2   = get_down_genes(deg_H3N2),
+  H7N7   = get_down_genes(deg_H7N7),
+  H7N9   = get_down_genes(deg_H7N9),
+  VN1203 = get_down_genes(deg_VN1203)
+)
+
+# Plot Upregulated DEGs intersection
+plot_UP <- ggVennDiagram(list_UP, label_alpha = 0, set_size = 4) +
+  scale_fill_gradient(low = "#F4FAFE", high = "#E41A1C") +
+  labs(title = "Upregulated Genes at 24h", subtitle = "padj < 0.05, log2FC > 1") +
+  theme(legend.position = "none")
+
+# Plot Downregulated DEGs intersection
+plot_DOWN <- ggVennDiagram(list_DOWN, label_alpha = 0, set_size = 4) +
+  scale_fill_gradient(low = "#F4FAFE", high = "#377EB8") +
+  labs(title = "Downregulated Genes at 24h", subtitle = "padj < 0.05, log2FC < -1") +
+  theme(legend.position = "none")
+
+plot_UP
+plot_DOWN
+```
+
+# Focus on H7N9 specific dysregulated genes
+
+## H7N9 DEGs
+
+```{r}
+# Isolate H7N9 exclusive genes for downstream functional enrichment
+unique_up_H7N9 <- setdiff(list_UP$H7N9, c(list_UP$H3N2, list_UP$H7N7, list_UP$VN1203))
+unique_down_H7N9 <- setdiff(list_DOWN$H7N9, c(list_DOWN$H3N2, list_DOWN$H7N7, list_DOWN$VN1203))
+```
+
+## Heatmap targeted on H7N9 dysregulated genes
+
+```{r}
+# 1. Combine the unique up and down genes into one list
+h7n9_exclusive_genes <- c(unique_up_H7N9, unique_down_H7N9)
+
+# 2. Subset the main log2 normalized matrix to keep only these genes
+# We isolate only the 24h samples to keep the visual clean and focused
+idx_24h <- grep("_24h", colnames(data_log))
+matrix_24h <- data_log[h7n9_exclusive_genes, idx_24h]
+
+# 3. Scale the data by row (gene) to highlight relative differences across viruses
+# This centers each gene around 0, making patterns instantly visible
+matrix_scaled <- t(scale(t(matrix_24h)))
+
+# 4. Create annotation dataframe for the top of the heatmap
+annotation_col <- data.frame(
+  Virus = sapply(strsplit(colnames(matrix_24h), "_"), `[`, 1)
+)
+rownames(annotation_col) <- colnames(matrix_24h)
+
+# Define matching colors for the annotation
+ann_colors <- list(
+  Virus = c(H3N2 = "#377EB8", H7N7 = "#FF7F00", 
+            H7N9 = "#984EA3", mock = "#E41A1C", VN1203 = "#4DAF4A")
+)
+
+# 5. Generate the heatmap
+pheatmap(matrix_scaled, 
+         cluster_cols = TRUE,    # Cluster samples based on expression similarity
+         cluster_rows = FALSE,    # Cluster genes with similar patterns
+         show_rownames = FALSE,  # Hide 2,000+ gene names to keep it readable
+         annotation_col = annotation_col,
+         annotation_colors = ann_colors,
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+         main = "Expression Profile of H7N9-Exclusive DEGs at 24h",
+         fontsize_col = 8)
+```
+
+## Functional Enrichment : H7N9 Exclusive Signature
+
+Export for Web Tools (EnrichR, Web Reactome, STRING-db)
+
+```{r}
+output_dir <- "../data/processed_data"
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Export raw gene lists as simple text files
+write.table(unique_up_H7N9, file = file.path(output_dir, "H7N9_exclusive_UP.txt"), 
+            row.names = FALSE, col.names = FALSE, quote = FALSE)
+write.table(unique_down_H7N9, file = file.path(output_dir, "H7N9_exclusive_DOWN.txt"), 
+            row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+```
+
+## All viruses dyregulated genes
+
+```{r}
+
+```
+
+### ReactomePA
+
+```{r}
+# 1. Convert Gene Symbols to Entrez IDs (Required by most pathway databases)
+genes_up_entrez <- bitr(unique_up_H7N9, 
+                        fromType = "SYMBOL", 
+                        toType = "ENTREZID", 
+                        OrgDb = org.Hs.eg.db)
+
+genes_down_entrez <- bitr(unique_down_H7N9, 
+                          fromType = "SYMBOL", 
+                          toType = "ENTREZID", 
+                          OrgDb = org.Hs.eg.db)
+
+# 2. Run Reactome Enrichment Analysis (Relaxing the UP cutoff to see trends)
+reactome_up <- enrichPathway(gene = genes_up_entrez$ENTREZID, 
+                             organism = "human", 
+                             pvalueCutoff = 0.2,   # Relaxed threshold to force output
+                             readable = TRUE)
+
+reactome_down <- enrichPathway(gene = genes_down_entrez$ENTREZID, 
+                               organism = "human", 
+                               pvalueCutoff = 0.05, 
+                               readable = TRUE)
+
+# 3. Visualize Top Pathways (Adding label_format to wrap long text)
+dotplot(reactome_up, showCategory = 15, 
+        title = "Reactome: Upregulated in H7N9 (Exclusive)", 
+        label_format = 40)
+
+dotplot(reactome_down, showCategory = 15, 
+        title = "Reactome: Downregulated in H7N9 (Exclusive)", 
+        label_format = 50) +
+  theme(axis.text.y = element_text(size = 7, lineheight = 0.8))
+```
+
+### EnrichR (GO, KEGG)
+
+```{r}
+# 1. Define the reference databases to capture a multi-dimensional biological profile:
+# - GO Biological Process (BP): Identifies the overarching systemic responses (e.g., immune evasion, cell death).
+# - GO Molecular Function (MF): Highlights the specific biochemical activities of the dysregulated proteins.
+# - GO Cellular Component (CC): Maps subcellular localization to show where the virus hijacks host machinery.
+# - KEGG: Maps the gene lists to well-established signaling and metabolic pathways.
+dbs <- c("GO_Biological_Process_2023", 
+         "GO_Molecular_Function_2023", 
+         "GO_Cellular_Component_2023", 
+         "KEGG_2021_Human")
+
+# 2. Query the EnrichR API using the isolated H7N9-exclusive gene symbols.
+# This statistically evaluates which biological concepts are significantly 
+# over-represented in our specific viral signature compared to random chance.
+enrich_up <- enrichr(unique_up_H7N9, dbs)
+enrich_down <- enrichr(unique_down_H7N9, dbs)
+
+# 3. Visualize Cellular Component (CC) for Downregulated genes.
+# Identifying suppressed structural components often reveals which host barriers 
+# or antigen presentation machinery the virus actively dismantles (e.g., cell surface).
+plotEnrich(enrich_down[["GO_Cellular_Component_2023"]], 
+           showTerms = 15, 
+           numChar = 50, 
+           y = "Count", 
+           orderBy = "P.value") +
+  ggtitle("GO Cellular Component: Downregulated uniquely in H7N9") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10))
+
+# 4. Visualize Biological Process (BP) for Downregulated genes.
+# This complements the CC spatial data by showing exactly which functional 
+# defense programs the virus is shutting down at those subcellular locations.
+plotEnrich(enrich_down[["GO_Biological_Process_2023"]], 
+           showTerms = 15, 
+           numChar = 50, 
+           y = "Count", 
+           orderBy = "P.value") +
+  ggtitle("GO Biological Process: Downregulated uniquely in H7N9") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10))
+```
+
+# Volcano plots
+
+```{r}
+# Function to generate a standardized Volcano Plot
+plot_volcano <- function(deg_df, virus_name) {
+  
+  # 1. Categorize genes based on our exact thresholds
+  deg_df$Regulation <- "Not Significant"
+  deg_df$Regulation[deg_df$logFC > 1 & deg_df$padj < 0.05] <- "Upregulated"
+  deg_df$Regulation[deg_df$logFC < -1 & deg_df$padj < 0.05] <- "Downregulated"
+  
+  # Enforce factor levels for consistent coloring
+  deg_df$Regulation <- factor(deg_df$Regulation, 
+                              levels = c("Downregulated", "Not Significant", "Upregulated"))
+  
+  # 2. Extract the top 15 most significant genes for labeling
+  top_genes <- head(deg_df[order(deg_df$padj), ], 15)
+  
+  # 3. Build the plot mapping magnitude (logFC) against significance (-log10 padj)
+  ggplot(deg_df, aes(x = logFC, y = -log10(padj), color = Regulation)) +
+    geom_point(alpha = 0.5, size = 1.2) +
+    scale_color_manual(values = c("Downregulated" = "#377EB8", 
+                                  "Not Significant" = "grey80", 
+                                  "Upregulated" = "#E41A1C")) +
+    # Add threshold lines
+    geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black", alpha = 0.5) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black", alpha = 0.5) +
+    # Add non-overlapping labels for top genes
+    geom_text_repel(data = top_genes, aes(label = Gene), 
+                    size = 3, color = "black", max.overlaps = 20) +
+    labs(title = paste(virus_name, "Transcriptomic Response"),
+         subtitle = "24h post-infection vs Mock control",
+         x = "Magnitude of Change (Log2 Fold Change)",
+         y = "Statistical Significance (-Log10 Adjusted P-value)") +
+    theme_minimal() +
+    theme(legend.position = "bottom",
+          plot.title = element_text(face = "bold"))
+}
+
+# Generate and display the Volcano plot for H7N9
+volcano_H7N9 <- plot_volcano(deg_H7N9, "H7N9")
+volcano_H7N9
+
+# Volcano plots for other viruses
+plot_volcano(deg_H3N2, "H3N2")
+plot_volcano(deg_H7N7, "H7N7")
+plot_volcano(deg_VN1203, "VN1203")
+```
