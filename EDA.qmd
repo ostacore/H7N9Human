@@ -21,6 +21,8 @@ knitr::opts_knit$set(root.dir = "D:/BMC - Data Analysis Workshop in Immunology/H
 #install.packages("enrichR")
 #install.packages("msigdbr")
 #install.packages("dplyr")
+#if (!requireNamespace("STRINGdb", quietly = TRUE)) BiocManager::install("STRINGdb")
+#install.packages(c("igraph", "ggraph"))
 
 # Imports
 library(enrichR)
@@ -38,6 +40,9 @@ library(limma)
 library(dplyr)
 library(emmeans)
 library(stringr)
+library(STRINGdb)
+library(igraph)
+library(ggraph)
 ```
 
 ```{r}
@@ -1324,4 +1329,169 @@ gseaplot2(gsea_react[["H7N9"]], geneSetID = react_ids,
           title = "GSEA: ER-Golgi Glycosylation & MHC-II in H7N9 (24h vs Mock)")
 ```
 
-String DB ??
+## StringDB for H7N9 Exclusive Genes
+
+```{r}
+# Local cache prevents re-downloading human STRING v12.0 files on every render
+string_cache <- file.path(output_dir, "stringdb_cache")
+dir.create(string_cache, recursive = TRUE, showWarnings = FALSE)
+
+string_db <- STRINGdb$new(
+  version         = "12.0",
+  species         = 9606,
+  score_threshold = 400,
+  network_type    = "full",
+  input_directory = string_cache
+)
+
+# Module and secreted/degranulation lookup tables
+mod_lookup <- module_map %>%
+  group_by(gene) %>%
+  summarise(Module = if (n() > 1) "Shared" else first(module), .groups = "drop")
+
+neut_genes <- unlist(strsplit(
+  res_down$geneID[res_down$Description == "Neutrophil degranulation"], "/"
+))
+
+down_df <- deg_H7N9 %>%
+  filter(Gene %in% unique_down_H7N9) %>%
+  transmute(gene = Gene, logFC = round(logFC, 2)) %>%
+  left_join(mod_lookup, by = "gene") %>%
+  mutate(
+    Axis = case_when(
+      !is.na(Module)           ~ Module,
+      gene %in% neut_genes     ~ "Secreted / Degranulation",
+      TRUE                     ~ "Other"
+    )
+  )
+
+# Map symbols to STRING IDs (keep strongest downregulation if multiple map to one protein)
+mapped_all <- string_db$map(down_df, "gene", removeUnmappedRows = TRUE) %>%
+  arrange(logFC) %>%
+  distinct(STRING_id, .keep_all = TRUE)
+
+cat(sprintf("STRING mapping: %d / %d H7N9-exclusive downregulated genes mapped (%.1f%%)\n",
+            nrow(mapped_all), nrow(down_df), 100 * nrow(mapped_all) / nrow(down_df)))
+
+edges_raw <- string_db$get_interactions(mapped_all$STRING_id) %>%
+  distinct(from, to, .keep_all = TRUE)
+
+# --- TIER A: Unbiased Global Network (High Confidence >= 700) ---
+edges_hi <- edges_raw %>% filter(combined_score >= 700)
+
+g_global <- graph_from_data_frame(edges_hi, directed = FALSE, vertices = mapped_all[, c("STRING_id", "gene", "logFC", "Axis")])
+g_global <- igraph::simplify(g_global, remove.multiple = TRUE, remove.loops = TRUE,
+                             edge.attr.comb = list(combined_score = "max", "ignore"))
+
+V(g_global)$degree      <- igraph::degree(g_global)
+V(g_global)$betweenness <- round(igraph::betweenness(g_global, normalized = TRUE), 4)
+
+g_global_conn <- induced_subgraph(g_global, which(V(g_global)$degree > 0))
+cl_louvain    <- cluster_louvain(g_global_conn, weights = E(g_global_conn)$combined_score / 1000)
+
+global_nodes <- igraph::as_data_frame(g_global_conn, what = "vertices") %>%
+  mutate(Cluster = membership(cl_louvain)) %>%
+  arrange(desc(degree), desc(betweenness))
+
+cat(sprintf("Global network (score >= 700): %d connected nodes, %d edges, %d Louvain communities\n",
+            vcount(g_global_conn), ecount(g_global_conn), length(unique(global_nodes$Cluster))))
+
+knitr::kable(
+  global_nodes %>% select(Gene = gene, Axis, logFC_24h = logFC, Degree = degree, Betweenness = betweenness, Cluster) %>% head(20),
+  row.names = FALSE,
+  caption = "Top 20 Global PPI Hub Proteins in the H7N9-Exclusive Downregulated Signature (STRING >= 700)"
+)
+
+cluster_summary <- global_nodes %>%
+  group_by(Cluster) %>%
+  summarise(
+    Size      = n(),
+    Top_Hubs  = paste(head(gene[order(-degree)], 6), collapse = ", "),
+    Top_Axes  = paste(names(sort(table(Axis), decreasing = TRUE))[1:min(2, length(unique(Axis)))], collapse = " / "),
+    .groups   = "drop"
+  ) %>%
+  arrange(desc(Size)) %>%
+  head(6)
+
+knitr::kable(cluster_summary, row.names = FALSE,
+             caption = "Largest Self-Assembling Protein Communities (Louvain Clustering, STRING >= 700)")
+
+# --- TIER B: Focused 3-Module Mechanistic Network (Medium + High Confidence >= 400) ---
+mapped_mod <- mapped_all %>% filter(!is.na(Module))
+edges_mod  <- edges_raw %>%
+  filter(from %in% mapped_mod$STRING_id & to %in% mapped_mod$STRING_id) %>%
+  mutate(conf_tier = ifelse(combined_score >= 700, "High (>=700)", "Medium (400-699)"))
+
+g_mod <- graph_from_data_frame(edges_mod, directed = FALSE,
+                               vertices = mapped_mod[, c("STRING_id", "gene", "logFC", "Module")])
+g_mod <- igraph::simplify(g_mod, remove.multiple = TRUE, remove.loops = TRUE,
+                          edge.attr.comb = list(combined_score = "max", conf_tier = "first"))
+
+V(g_mod)$degree <- igraph::degree(g_mod)
+g_mod_conn      <- induced_subgraph(g_mod, which(V(g_mod)$degree > 0))
+
+cat(sprintf("3-Module network (score >= 400): %d / %d mapped module genes connected (%d edges; %d isolated omitted)\n",
+            vcount(g_mod_conn), nrow(mapped_mod), ecount(g_mod_conn), nrow(mapped_mod) - vcount(g_mod_conn)))
+
+mod_palette <- c(
+  "Core Lysosome"     = "#D95F02",
+  "ER-Golgi (N-Glyc)" = "#1B9E77",
+  "MHC-II Axis"       = "#7570B3",
+  "Shared"            = "#E7298A"
+)
+
+set.seed(42)
+p_ppi <- ggraph(g_mod_conn, layout = "stress") +
+  geom_edge_link(aes(edge_width = combined_score, edge_linetype = conf_tier, edge_alpha = combined_score),
+                 color = "grey45") +
+  geom_node_point(aes(size = degree, fill = Module), shape = 21, color = "grey15", stroke = 0.6) +
+  geom_node_text(aes(label = gene), repel = TRUE, size = 3.2, fontface = "bold",
+                 box.padding = 0.4, point.padding = 0.25,
+                 min.segment.length = 0.2, segment.color = "grey50", max.overlaps = Inf) +
+  scale_fill_manual(values = mod_palette) +
+  scale_size_continuous(range = c(2.5, 8.5), name = "Degree") +
+  scale_edge_width(range = c(0.35, 1.5), guide = "none") +
+  scale_edge_alpha(range = c(0.25, 0.85), guide = "none") +
+  scale_edge_linetype_manual(values = c("High (>=700)" = "solid", "Medium (400-699)" = "dashed"),
+                             name = "STRING Confidence") +
+  scale_x_continuous(expand = expansion(mult = 0.12)) +
+  scale_y_continuous(expand = expansion(mult = 0.12)) +
+  theme_void(base_size = 12) +
+  theme(
+    legend.position = "right",
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.margin     = margin(15, 15, 15, 15),
+    plot.title      = element_text(face = "bold", size = 14, hjust = 0),
+    plot.subtitle   = element_text(size = 10, hjust = 0, margin = margin(b = 10))
+  ) +
+  labs(
+    title    = "STRING-db PPI Network: Endomembrane & MHC-II Modules",
+    subtitle = "Solid edges: high confidence (>=700); dashed edges: medium confidence (400-699); node size: degree"
+  )
+
+ggsave(file.path(output_dir, "stringdb_3modules_network.png"),
+       plot = p_ppi, width = 14, height = 10, dpi = 300, bg = "white")
+
+print(p_ppi)
+
+# Explicit table of cross-module bridge interactions
+mod_v_lookup <- setNames(mapped_mod$Module, mapped_mod$STRING_id)
+sym_lookup   <- setNames(mapped_mod$gene,   mapped_mod$STRING_id)
+
+bridge_edges <- igraph::as_data_frame(g_mod_conn, what = "edges") %>%
+  transmute(
+    Protein_A    = sym_lookup[from],
+    Module_A     = mod_v_lookup[from],
+    Protein_B    = sym_lookup[to],
+    Module_B     = mod_v_lookup[to],
+    STRING_score = combined_score
+  ) %>%
+  filter(Module_A != Module_B) %>%
+  arrange(desc(STRING_score))
+
+knitr::kable(head(bridge_edges, 20), row.names = FALSE,
+             caption = "Top 20 Cross-Module PPI Bridges Linking ER-Golgi, Core Lysosome, and MHC-II (Full list exported to CSV)")
+
+write.csv(global_nodes, file.path(output_dir, "stringdb_global_hubs.csv"), row.names = FALSE)
+write.csv(bridge_edges, file.path(output_dir, "stringdb_module_bridges.csv"), row.names = FALSE)
+```
