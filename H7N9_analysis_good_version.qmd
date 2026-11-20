@@ -28,6 +28,8 @@ library(ggVennDiagram)
 library(ggplot2)
 library(factoextra)
 library(corrplot)
+library(ggplot2)
+library(ggrepel)
 
 ```
 
@@ -337,7 +339,7 @@ pheatmap(matrix_scaled,
          show_rownames = FALSE,  # Hide 2,000+ gene names to keep it readable
          annotation_col = annotation_col,
          annotation_colors = ann_colors,
-         color = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+         color = colorRampPalette(c("blue", "white", "red"))(50),
          main = "Expression Profile of H7N9-Exclusive DEGs at 24h",
          fontsize_col = 8)
 ```
@@ -487,6 +489,10 @@ round(cor_h7n9, 2)
 #| eval: !expr all(sapply(c("clusterProfiler", "org.Hs.eg.db", "ReactomePA"), requireNamespace, quietly = TRUE))
 # Skipped automatically if the Bioconductor packages are not installed
 # (install them with the BiocManager line at the top of the file)
+options(BioC_mirror = "https://packagemanager.posit.co/bioconductor/latest",
+        BIOCONDUCTOR_CONFIG_FILE = "https://packagemanager.posit.co/bioconductor/latest/config.yaml")
+install.packages("shadowtext")
+BiocManager::install(c("enrichplot", "clusterProfiler", "org.Hs.eg.db", "ReactomePA"), update = FALSE)
 library(clusterProfiler)
 library(org.Hs.eg.db)
 library(ReactomePA)
@@ -648,6 +654,32 @@ panel[!panel %in% rownames(data_log)]   # gènes absents
 ```
 
 ```{r}
+setEnrichrSite("Enrichr")
+dbs <- c("GO_Biological_Process_2023", "Reactome_2022", "KEGG_2021_Human")
+run_enrich <- function(genes, nom) {
+  if (length(genes) < 5) { cat("Trop peu de gènes pour", nom, "\n"); return(NULL) }
+  enr <- enrichr(genes, dbs)
+  for (db in dbs) write.csv(enr[[db]], paste0("results/enrichR_", nom, "_", db, ".csv"),
+                            row.names = FALSE)
+  p <- plotEnrich(enr[["GO_Biological_Process_2023"]], showTerms = 20,
+                  numChar = 50, y = "Count", orderBy = "P.value") +
+    labs(title = paste("GO BP -", nom))
+  print(p)
+  ggsave(paste0("figures/09_enrichR_", nom, ".png"), p, width = 9, height = 7)
+  enr
+}
+
+enr_H7N9  <- run_enrich(deg[[paste("H7N9", t_max, sep = "_")]], paste0("H7N9_", t_max))
+enr_spec  <- run_enrich(spec_H7N9, "specifiques_H7N9")
+enr_comm  <- run_enrich(communs,   "communs")
+
+# Pour Reactome (site web) et STRING (string-db.org) : copier-coller les listes
+# de results/genes_specifiques_H7N9.csv et results/genes_communs.csv
+
+
+```
+
+```{r}
 genes_cles <- intersect(c("IFNB1", "GBP7", "IL28B", "CXCL9", "C17", "IL29",
                           "IL28A", "CCL5", "IL6", "TNF", "IFIT1B", "SLC15A3","PPBP" ), rownames(expr))
 if (length(genes_cles) > 0) {
@@ -678,4 +710,262 @@ cat("\nTerminé ! Figures dans figures/, tableaux dans results/\n")
 
 
 
+```
+
+### ANOVA test
+
+For each key gene and each time point, H7N9 was compared to each of the three other viruses: one-way ANOVA (factor = virus) on the per-replicate log2FC vs mock, followed by a Dunnett post-hoc test (each virus vs H7N9). ANOVA p-values were BH-adjusted for the 48 tests (12 genes x 4 time points). A gene is considered **H7N9-specific** at a given time when the three Dunnett comparisons are all significant (adjusted p \< 0.05) and in the same direction. This criterion is strict: when a star is shown, the difference is solid.
+
+```{r}
+library(ggplot2)
+library(emmeans)
+
+# 0. Data: log2FC of EACH replicate = expression - mean of the mocks at the same time
+genes_anova <- intersect(c("IFNB1", "GBP7", "IL28B", "CXCL9", "IL29", "IL28A",
+                           "CCL5", "IL6", "TNF", "IFIT1B", "SLC15A3", "PPBP"),
+                         rownames(data_log))
+is_mock <- metadata$Virus == "mock"
+
+kin_rep <- do.call(rbind, lapply(genes_anova, function(g) {
+  y <- as.numeric(data_log[g, ])
+  mock_mean <- tapply(y[is_mock], metadata$Timepoint[is_mock], mean)
+  data.frame(gene  = g,
+             virus = metadata$Virus[!is_mock],
+             time  = metadata$Timepoint[!is_mock],
+             lfc   = y[!is_mock] - mock_mean[metadata$Timepoint[!is_mock]])
+}))
+kin_rep$virus <- relevel(factor(kin_rep$virus), ref = "H7N9")   # H7N9 = reference
+kin_rep$time  <- factor(kin_rep$time, levels = c("03h", "07h", "12h", "24h"))
+
+# 1. One factor ANOVA
+anova_time <- do.call(rbind, lapply(genes_anova, function(g) {
+  do.call(rbind, lapply(levels(kin_rep$time), function(t) {
+    dt  <- kin_rep[kin_rep$gene == g & kin_rep$time == t, ]
+    fit <- aov(lfc ~ virus, data = dt)
+    s   <- summary(fit)[[1]]
+    rownames(s) <- trimws(rownames(s))
+    data.frame(gene = g, time = t,
+               F_value = round(s["virus", "F value"], 1),
+               p_value = s["virus", "Pr(>F)"])
+  }))
+}))
+anova_time$p_adj  <- p.adjust(anova_time$p_value, method = "BH")   # 12 genes x 4 times = 48 tests
+anova_time$signif <- as.character(cut(anova_time$p_adj, c(-Inf, 0.001, 0.01, 0.05, Inf),
+                                      c("***", "**", "*", "ns")))
+anova_time$time   <- factor(anova_time$time, levels = levels(kin_rep$time))
+
+# Table
+tab_wide <- reshape(anova_time[, c("gene", "time", "signif")],
+                    idvar = "gene", timevar = "time", direction = "wide")
+names(tab_wide) <- sub("signif.", "", names(tab_wide))
+knitr::kable(tab_wide, row.names = FALSE,
+             caption = "Global test - one-way ANOVA (virus) at each time point, BH-adjusted")
+```
+
+```{r}
+# 2. Post-hoc : H7N9 vs Viruses, at each time
+posthoc_time <- do.call(rbind, lapply(genes_anova, function(g) {
+  do.call(rbind, lapply(levels(kin_rep$time), function(t) {
+    fit <- aov(lfc ~ virus, data = kin_rep[kin_rep$gene == g & kin_rep$time == t, ])
+    ct  <- as.data.frame(contrast(emmeans(fit, ~ virus), method = "trt.vs.ctrl", ref = "H7N9"))
+    data.frame(gene = g, time = t, contrast = ct$contrast,
+               diff_vs_H7N9 = round(ct$estimate, 2), p_adj = signif(ct$p.value, 3))
+  }))
+}))
+dir.create("results", showWarnings = FALSE)
+write.csv(anova_time,   "results/anova_par_temps.csv", row.names = FALSE)
+write.csv(posthoc_time, "results/anova_par_temps_posthoc.csv", row.names = FALSE)
+
+# 3. H7N9 different from EACH of the 3 other viruses, in the same direction
+#    diff_vs_H7N9 = other virus - H7N9  ->  all > 0 : H7N9 lower than all ; all < 0 : H7N9 higher than all
+#    The star level uses the LEAST significant of the 3 Dunnett p-values (conservative)
+h7n9_spec <- do.call(rbind, lapply(split(posthoc_time, list(posthoc_time$gene, posthoc_time$time)),
+  function(d) data.frame(gene = d$gene[1], time = d$time[1],
+                         all_lower  = all(d$diff_vs_H7N9 > 0 & d$p_adj < 0.05),
+                         all_higher = all(d$diff_vs_H7N9 < 0 & d$p_adj < 0.05),
+                         p_max      = max(d$p_adj))))
+h7n9_spec$direction <- ifelse(h7n9_spec$all_lower, "H7N9 lower than all",
+                       ifelse(h7n9_spec$all_higher, "H7N9 higher than all", "-"))
+h7n9_spec$signif <- ifelse(h7n9_spec$direction != "-",
+                           as.character(cut(h7n9_spec$p_max, c(-Inf, 0.001, 0.01, 0.05),
+                                            c("***", "**", "*"))),
+                           "ns")
+h7n9_spec$time <- factor(h7n9_spec$time, levels = levels(kin_rep$time))
+h7n9_spec <- h7n9_spec[order(h7n9_spec$gene, h7n9_spec$time), ]
+
+# Summary table: one row per gene, one column per time
+spec_wide <- reshape(h7n9_spec[, c("gene", "time", "signif")],
+                     idvar = "gene", timevar = "time", direction = "wide")
+names(spec_wide) <- sub("signif.", "", names(spec_wide))
+knitr::kable(spec_wide, row.names = FALSE,
+             caption = "H7N9 significantly different from each of the 3 other viruses (Dunnett, worst p)")
+
+# Detail of the significant Dunnett comparisons
+knitr::kable(posthoc_time[posthoc_time$p_adj < 0.05, ], row.names = FALSE,
+             caption = "Dunnett post-hoc: each virus vs H7N9 (significant comparisons only; diff = other virus - H7N9)")
+write.csv(h7n9_spec, "results/anova_H7N9_specific.csv", row.names = FALSE)
+```
+
+```{r}
+#| fig-width: 12
+#| fig-height: 14
+
+# 4. Figure : stars = H7N9 different from each of the 3 other viruses
+kin_sum <- do.call(data.frame, aggregate(lfc ~ gene + virus + time, data = kin_rep,
+                   FUN = function(x) c(m = mean(x), se = sd(x) / sqrt(length(x)))))
+y_top <- aggregate(cbind(top = lfc.m + lfc.se) ~ gene, data = kin_sum, FUN = max)
+y_bot <- aggregate(cbind(bot = lfc.m - lfc.se) ~ gene, data = kin_sum, FUN = min)
+stars <- merge(merge(h7n9_spec, y_top), y_bot)
+stars$y <- stars$top + 0.12 * (stars$top - stars$bot)
+
+p_time <- ggplot(kin_sum, aes(time, lfc.m, color = virus, group = virus)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbar(aes(ymin = lfc.m - lfc.se, ymax = lfc.m + lfc.se), width = 0.15) +
+  geom_line(linewidth = 0.8) + geom_point(size = 2) +
+  geom_text(data = stars,
+            aes(time, y, label = signif,
+                vjust = ifelse(signif == "ns", 0.3, 0.7),   # aligns stars and ns
+                size  = signif == "ns"),
+            inherit.aes = FALSE, fontface = "bold") +
+  scale_size_manual(values = c(`FALSE` = 6, `TRUE` = 4.5), guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.18))) +   # for stars
+  scale_color_manual(values = c(H7N9 = "#984EA3", H3N2 = "#377EB8",
+                                H7N7 = "#FF7F00", VN1203 = "#4DAF4A")) +
+  facet_wrap(~ gene, ncol = 3, scales = "free_y") +
+  theme_bw(base_size = 19) +
+  theme(strip.text = element_text(size = 16, face = "bold"),
+        legend.position = "top", legend.title = element_blank()) +
+  labs(title = "Kinetics of key genes - H7N9 vs each other virus",
+       subtitle = paste0("Mean ± SEM; stars = H7N9 significantly different from each of the 3 other viruses\n",
+                         "(one-way ANOVA + Dunnett, worst of 3 p-values): *** p < 0.001, ** p < 0.01, * p < 0.05"),
+       x = "Time post-infection", y = "log2FC vs mock")
+print(p_time)
+ggsave("figures/11_cinetique_anova_par_temps.png", p_time, width = 12, height = 14, dpi = 300)
+```
+
+# H7N9 compared directly to each other virus (24h)
+
+Up to now, each virus has been compared to the **mock**. Here we test **directly** H7N9 vs each other virus at 24h (same Student t-test, but without the mock): log2FC \> 0 = gene **higher in H7N9**, log2FC \< 0 = gene **lower in H7N9**.
+
+[*IDK if it's usefull for our report*]{.underline}
+
+```{r}
+# Student t-test between two viruses at the same time point (same formula as de_test)
+de_pair <- function(v1, v2, time = "24h") {
+  a <- logexpr[, meta$virus == v1 & meta$time == time, drop = FALSE]
+  b <- logexpr[, meta$virus == v2 & meta$time == time, drop = FALSE]
+  n1 <- ncol(a); n2 <- ncol(b)
+  m1 <- rowMeans(a); m2 <- rowMeans(b)
+  var_a <- rowSums((a - m1)^2) / (n1 - 1)
+  var_b <- rowSums((b - m2)^2) / (n2 - 1)
+  sp2   <- ((n1 - 1) * var_a + (n2 - 1) * var_b) / (n1 + n2 - 2)
+  tstat <- (m1 - m2) / sqrt(sp2 * (1 / n1 + 1 / n2))
+  pval  <- 2 * pt(-abs(tstat), df = n1 + n2 - 2)
+  data.frame(gene = rownames(logexpr), log2FC = m1 - m2,
+             pval = pval, padj = p.adjust(pval, method = "BH"))
+}
+
+others   <- c("H7N7", "H3N2", "VN1203")
+key_genes <- c("IFNB1", "IL6", "CXCL10", "IFIT1", "MX1")   # genes highlighted on the plots
+
+pair <- lapply(setNames(others, others), function(o) de_pair("H7N9", o, "24h"))
+
+
+# Number of genes higher / lower in H7N9 (same thresholds as before)
+sapply(pair, function(d) c(higher_in_H7N9 = sum(is_deg(d) & d$log2FC > 0),
+                           lower_in_H7N9  = sum(is_deg(d) & d$log2FC < 0)))
+```
+
+```{r}
+volcano_pair <- function(other, n_labels = 8) {
+  d <- pair[[other]]
+  d <- d[!is.na(d$pval), ]
+  d$statut <- "NS"
+  d$statut[is_deg(d) & d$log2FC > 0] <- "Higher in H7N9"
+  d$statut[is_deg(d) & d$log2FC < 0] <- paste("Higher in", other)
+  d$statut <- factor(d$statut, levels = c("Higher in H7N9", paste("Higher in", other), "NS"))
+  cols <- setNames(c("red", "blue", "grey75"), levels(d$statut))
+  
+  # labels = key genes + the most significant genes
+  top  <- head(d[d$statut != "NS", ][order(d$pval[d$statut != "NS"]), ], n_labels)
+  keys <- d[d$gene %in% key_genes, ]
+  
+  ggplot(d, aes(log2FC, -log10(pval), color = statut)) +
+    geom_point(size = 1, alpha = 0.6) +
+    geom_vline(xintercept = c(-FC_cut, FC_cut), linetype = "dashed", linewidth = 0.4) +
+    geom_hline(yintercept = -log10(P_cut), linetype = "dashed", linewidth = 0.4) +
+    geom_point(data = keys, shape = 21, size = 3, fill = "gold", color = "black") +
+    geom_text_repel(data = top, aes(label = gene), color = "grey20", size = 3,
+                    max.overlaps = 30, show.legend = FALSE) +
+    geom_label_repel(data = keys, aes(label = gene), color = "black", fill = "gold",
+                     size = 3.2, fontface = "bold", max.overlaps = Inf,
+                     box.padding = 0.6, show.legend = FALSE) +
+    scale_color_manual(values = cols, name = NULL, drop = FALSE) +
+    theme_bw(base_size = 13) +
+    theme(panel.grid = element_blank(), legend.position = "top",
+          plot.title = element_text(hjust = 0.5, face = "bold")) +
+    labs(title = paste0("H7N9 vs ", other, " (24h)"),
+         subtitle = paste0(sum(d$statut == "Higher in H7N9"), " higher in H7N9 / ",
+                           sum(d$statut == paste("Higher in", other)), " higher in ", other),
+         x = expression(log[2]~"FC (H7N9 / other virus)"),
+         y = expression(-log[10]~italic(p)*"-value"))
+}
+
+for (o in others) {
+  p <- volcano_pair(o)
+  print(p)
+  ggsave(paste0("figures/09_volcano_H7N9_vs_", o, "_24h.png"), p, width = 7, height = 6.5, dpi = 300)
+}
+```
+
+## Scatter plots: log2FC vs mock, H7N9 against each other virus
+
+Each point is a gene that is DEG (vs mock, 24h) in H7N9 **or** in the other virus.
+
+```{r}
+scatter_pair <- function(other) {
+  a <- res[["H7N9_24h"]]
+  b <- res[[paste0(other, "_24h")]]
+  genes <- union(deg[["H7N9_24h"]], deg[[paste0(other, "_24h")]])
+  
+  d <- data.frame(gene = genes,
+                  x = a$log2FC[match(genes, a$gene)],
+                  y = b$log2FC[match(genes, b$gene)])
+  dp <- pair[[other]][match(genes, pair[[other]]$gene), ]
+  d$statut <- "NS"
+  d$statut[is_deg(dp) & dp$log2FC > 0] <- "Higher in H7N9"
+  d$statut[is_deg(dp) & dp$log2FC < 0] <- paste("Higher in", other)
+  d$statut <- factor(d$statut, levels = c("Higher in H7N9", paste("Higher in", other), "NS"))
+  cols <- setNames(c("red", "blue", "grey75"), levels(d$statut))
+  
+  r     <- cor(d$x, d$y)
+  slope <- coef(lm(x ~ y, data = d))[2]   # H7N9 explained by the other virus: < 1 = attenuated
+  keys  <- d[d$gene %in% key_genes, ]
+  lim   <- range(c(d$x, d$y))
+  
+  ggplot(d, aes(x, y, color = statut)) +
+    geom_hline(yintercept = 0, color = "grey60") +
+    geom_vline(xintercept = 0, color = "grey60") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    geom_point(size = 0.8, alpha = 0.5) +
+    geom_point(data = keys, shape = 21, size = 3, fill = "gold", color = "black") +
+    geom_label_repel(data = keys, aes(label = gene), color = "black", fill = "gold",
+                     size = 3.2, fontface = "bold", max.overlaps = Inf,
+                     box.padding = 0.6, show.legend = FALSE) +
+    scale_color_manual(values = cols, name = NULL, drop = FALSE) +
+    coord_equal(xlim = lim, ylim = lim) +
+    theme_bw(base_size = 13) +
+    theme(panel.grid = element_blank(), legend.position = "top",
+          plot.title = element_text(hjust = 0.5, face = "bold")) +
+    labs(title = paste0("log2FC vs mock at 24h: H7N9 vs ", other),
+         subtitle = paste0(nrow(d), " DEG genes - r = ", round(r, 2),
+                           " - slope H7N9 ~ ", other, " = ", round(slope, 2)),
+         x = "log2FC H7N9 vs mock", y = paste0("log2FC ", other, " vs mock"))
+}
+
+for (o in others) {
+  p <- scatter_pair(o)
+  print(p)
+  ggsave(paste0("figures/10_scatter_H7N9_vs_", o, "_24h.png"), p, width = 7, height = 7.5, dpi = 300)
+}
 ```
