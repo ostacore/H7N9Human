@@ -1,0 +1,106 @@
+---
+title: "DEG, pathway analysis, GSEA"
+format: html
+editor: visual
+---
+
+```{r}
+install.packages("usethis")
+library(usethis)
+
+library(limma)        
+library(ggplot2)       
+library(clusterProfiler) 
+library(org.Hs.eg.db)    
+library(ReactomePA)   
+library(enrichplot)       
+
+setwd("/Users/emmakomers/Desktop/projectB/")
+mydata <- read.delim("Project-H7N9Human.txt", check.names = FALSE)
+
+#create output folder
+output_folder <- paste0("results_", format(Sys.time(), "%Y-%m-%d_%H-%M-%S"))
+dir.create(output_folder)
+
+setwd(output_folder)
+cat("Saving all figures to:", getwd(), "\n")   # shows where the files will go
+```
+
+define variables:
+
+```{r}
+viruses <- c("H7N9", "H7N7", "H3N2", "VN1203")
+times   <- c("03h", "07h", "12h", "24h")
+padj_cutoff  <- 0.05
+logfc_cutoff <- 1
+```
+
+## 1. create metadata table
+
+Assign sample a virus and time point from the sample names (format = virus_time_replicate)
+
+```{r}
+# Start a table with one row per sample.
+metadata <- data.frame(sample = colnames(mydata))
+
+# sub() finds a pattern in text and replaces it. Here we use it to cut out
+# the pieces of each sample name.
+metadata$virus     <- sub("_.*", "", metadata$sample)                  # text before first "_"
+metadata$timepoint <- sub("^[^_]+_([^_]+)_.*$", "\\1", metadata$sample) # text between the "_"s
+metadata$replicate <- sub("^.*_", "", metadata$sample)                 # text after last "_"
+
+# Turn timepoint into an ordered factor so plots show 3h, 7h, 12h, 24h in order
+# (otherwise R sorts alphabetically).
+metadata$timepoint <- factor(metadata$timepoint, levels = times)
+
+# Show how many samples (replicates) we have for each virus/time combination.
+print(table(metadata$virus, metadata$timepoint))
+
+# More safety checks: all time points were recognised, and all virus names are expected.
+stopifnot(!anyNA(metadata$timepoint))
+stopifnot(all(metadata$virus %in% c("mock", viruses)))
+```
+
+## Log-transform data
+
+log2 of all data:
+
+```{r}
+expression_log <- log2(as.matrix(mydata))
+```
+
+create **boxplot** + save as pdf:
+
+```{r}
+pdf("01_sample_boxplots.pdf", width = 14, height = 6)   # open a PDF file
+boxplot(expression_log, las = 2, cex.axis = 0.5,
+        main = "Log2 expression by sample", ylab = "Log2 expression")
+dev.off()                                         # close (save) the PDF
+```
+
+## PCA
+
+```{r}
+#remove genes with zero variation:
+variable_genes <- apply(expression_log, 1, sd) > 0
+
+#transpose data:
+pca <- prcomp(t(expression_log[variable_genes, , drop = FALSE]), scale. = TRUE)
+
+#plot
+pca_plot <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], metadata)
+pca_figure <- ggplot(pca_plot, aes(PC1, PC2, color = virus, shape = timepoint)) +
+  geom_point(size = 2.5) +
+  theme_minimal() +
+  labs(title = "PCA of samples")
+print(pca_figure)    
+ggsave("02_PCA.png", pca_figure, width = 8, height = 6)  # save as PNG
+```
+
+## Build statistical model
+
+```{r}
+
+
+
+```
