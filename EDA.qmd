@@ -36,22 +36,13 @@ library(ReactomePA) # Guangchuang Yu, Qing-Yu He. ReactomePA: an R/Bioconductor 
 library(msigdbr)
 library(limma)
 library(dplyr)
+library(emmeans)
+library(stringr)
 ```
 
 ```{r}
 # Read dataset
 data = read.delim("../data/Project-H7N9Human.txt")
-```
-
-```{r}
-# 21.6%, 20.2% and 29.9% gene IDs failed to map in Entrez IDs: updating outdated aliases
-
-update_symbols <- function(genes) {
-  updated <- alias2SymbolTable(genes, species = "Hs")
-  ifelse(is.na(updated), genes, updated)
-}
-
-rownames(data_log) <- make.unique(update_symbols(rownames(data_log)))
 ```
 
 ```{r}
@@ -118,6 +109,17 @@ boxplot(data_log,
         ylab = "Expression level(log2)")
 ```
 
+```{r}
+# More than 20% of gene IDs failed to map in Entrez IDs: trying to update outdated aliases
+
+update_symbols <- function(genes) {
+  updated <- alias2SymbolTable(genes, species = "Hs")
+  ifelse(is.na(updated), genes, updated)
+}
+
+rownames(data_log) <- make.unique(update_symbols(rownames(data_log)))
+```
+
 ## PCA
 
 ```{r}
@@ -139,7 +141,20 @@ fviz_pca_ind(pca_res,
 ### Removing 24h time points to look at virus response kinetics
 
 ```{r}
+idx_early <- metadata$Timepoint != "24h"
+meta_early <- metadata[idx_early, ]
+pca_early  <- prcomp(t(data_log[, idx_early]), scale. = FALSE) # Wny not scaled !
 
+fviz_pca_ind(pca_early,
+             geom = "point",
+             col.ind = meta_early$Virus,
+             pointshape = meta_early$Timepoint,
+             addEllipses = FALSE,
+             palette = "jco",
+             pointsize = 2,
+             title = "PCA - Early & Mid Kinetics (03h, 07h, 12h)") +
+  theme_minimal() +
+  theme(legend.position = "right")
 ```
 
 ## Viral trajectories
@@ -165,7 +180,7 @@ ggplot(pca_data, aes(x = PC1, y = PC2, color = Virus)) +
                                 "H7N9"="#984EA3", "mock"="#E41A1C", 
                                 "VN1203"="#4DAF4A")) +
   labs(title = "Viral Transcriptomic Trajectories Over Time",
-       x = "Dim 1", y = "Dim 2") +
+       x = "Dim1", y = "Dim2") +
   theme_minimal() +
   theme(legend.position = "right")
 ```
@@ -597,6 +612,64 @@ plotEnrich(enrich_down[["KEGG_2021_Human"]],
   theme_minimal() + theme(axis.text.y = element_text(size = 10))
 ```
 
+```{r}
+# 1. Define reference databases covering biological processes, molecular functions,
+#    subcellular localization, and canonical signaling/metabolic pathways
+dbs <- c(
+  "GO BP" = "GO_Biological_Process_2023",
+  "GO MF" = "GO_Molecular_Function_2023",
+  "GO CC" = "GO_Cellular_Component_2023",
+  "KEGG"  = "KEGG_2021_Human"
+)
+
+# Restrict statistical background to genes actually measured on the array
+bg_symbols <- rownames(data_log)
+
+# 2. Query EnrichR for H7N9-exclusive upregulated and downregulated signatures
+enrich_up   <- enrichr(unique_up_H7N9, unname(dbs), background = bg_symbols, include_overlap = TRUE)
+enrich_down <- enrichr(unique_down_H7N9, unname(dbs), background = bg_symbols, include_overlap = TRUE)
+
+# 3. Plot top FDR-significant terms with adjusted p-value color scaling
+plot_enrichr_fdr <- function(enrich_list, db_key, db_label, direction,
+                             fdr_cutoff = 0.05, top_n = 10) {
+  df <- enrich_list[[db_key]]
+  df <- df[df$Adjusted.P.value < fdr_cutoff, ]
+  
+  if (nrow(df) == 0) {
+    message(sprintf("No significant terms (FDR < %.2f) for %s (%s)", fdr_cutoff, db_label, direction))
+    return(invisible(NULL))
+  }
+  
+  df <- df[order(df$Adjusted.P.value, df$P.value), ]
+  df <- head(df, top_n)
+  df$Count <- as.numeric(sub("/.*", "", df$Overlap))
+  df$Term_label <- str_wrap(df$Term, width = 45)
+  df$Term_label <- factor(df$Term_label, levels = rev(df$Term_label))
+  
+  ggplot(df, aes(x = Count, y = Term_label, fill = Adjusted.P.value)) +
+    geom_col() +
+    scale_fill_gradient(low = "#e06663", high = "#327eba", name = "p.adjust") +
+    labs(
+      title = sprintf("%s: %s in H7N9 (Exclusive)", db_label, direction),
+      x = "Gene count",
+      y = NULL
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.y = element_text(size = 9, lineheight = 0.85),
+      plot.title  = element_text(size = 11, face = "bold")
+    )
+}
+
+# 4. Generate filtered plots across all four databases for UP and DOWN signatures
+for (label in names(dbs)) {
+  p_up   <- plot_enrichr_fdr(enrich_up, dbs[[label]], label, "Upregulated")
+  p_down <- plot_enrichr_fdr(enrich_down, dbs[[label]], label, "Downregulated")
+  if (!is.null(p_up))   print(p_up)
+  if (!is.null(p_down)) print(p_down)
+}
+```
+
 ## Wikipathway
 
 ```{r}
@@ -670,4 +743,585 @@ plot_enrichment(hallmark_up, "MSigDB Hallmark: H7N9 Exclusive UP")
 plot_enrichment(hallmark_down, "MSigDB Hallmark: H7N9 Exclusive DOWN")
 ```
 
-GSEA, String DB ?
+### Down-Regulation (H7N9-Exclusive Signature at 24h)
+
+#### 1. Core Lysosomal Breakdown
+
+-   **Primary anchor:** *Lysosome* ranks #1 in KEGG (\~23 genes, $p_{\text{adj}} < 0.0003$) and #2 in GO CC (\~59 genes, $p_{\text{adj}} < 3 \times 10^{-7}$, immediately following the parent term *Intracellular Organelle Lumen* at \~81 genes).
+
+-   **Membrane and lumenal loss:** GO CC confirms strong suppression of both structural components (*Lysosomal Membrane*, \~44 genes) and the acidic interior (*Vacuolar Lumen*, \~26 genes; all top 10 GO CC terms at $p_{\text{adj}} \le 1 \times 10^{-6}$).
+
+-   **Enzymatic collapse:** GO MF directly reflects loss of lysosomal proteolysis via *Exopeptidase Activity* (\~10 genes, $p_{\text{adj}} \le 0.004$), while Reactome captures core lysosomal hydrolases and membrane proteins (`LAMP1`, `LAMP2`, `ATP6AP2`, cathepsins, glycosidases) within *Neutrophil degranulation* ($\text{GeneRatio} \approx 0.100$) and *Metabolism of carbohydrates* ($\text{GeneRatio} \approx 0.057$).
+
+#### 2. Upstream ER–Golgi Biogenesis & Secretory Bottleneck
+
+-   **Organelle supply chain:** GO CC maps the entire biosynthetic pipeline upstream of the lysosome, encompassing *Endoplasmic Reticulum Membrane* (\~69 genes), *Endoplasmic Reticulum Lumen* (\~34 genes), *Bounding Membrane Of Organelle* (\~72 genes), *COPII-coated ER To Golgi Transport Vesicle* (\~18 genes), and *Secretory Granule Lumen* (\~37 genes).
+
+-   **Post-translational sorting:** Reactome identifies *Asparagine N-linked glycosylation* ($\text{GeneRatio} \approx 0.060$), which is essential both for sorting soluble hydrolases from the Golgi to the lysosome and for shielding lysosomal membranes from self-digestion, alongside ER-folding and secretory spillover (*Regulation of IGF transport and uptake by IGFBPs*, *Maturation of spike protein*, and *Late SARS-CoV-2 Infection Events*).
+
+-   **Loss of mucosal antiproteases and secreted barrier cargo:** GO BP (*Negative Regulation Of Endopeptidase Activity*, \~10 genes, $p_{\text{adj}} \le 0.0125$) and GO MF (*Endopeptidase Inhibitor Activity*, \~20 genes; *Serine-Type Endopeptidase Inhibitor Activity*, \~13 genes; *Peptidase Inhibitor Activity*, \~8 genes) confirm downregulation of secreted airway antiproteases (`SLPI`, `SERPINA1`, `SERPINA3`, `CST3`) routed through this secretory pathway. This is accompanied by ER/vesicle cofactors (*Calcium Ion Binding*, \~36 genes; *Metal Ion Binding*, \~51 genes), organelle transporters (*Secondary Active Transmembrane Transporter Activity*, \~10 genes), and suppression of secreted extracellular matrix/adhesion glycoproteins captured by MSigDB Hallmark (*Epithelial Mesenchymal Transition*, 25 genes, $p_{\text{adj}} = 0.017$).
+
+#### 3. Downstream Immune Consequence: Endolysosomal MHC-II Silencing
+
+-   Because MHC class II peptide loading relies directly on endolysosomal acidification and cathepsin-mediated cleavage, lysosomal suppression links directly to adaptive immune evasion.
+
+-   This axis is independently confirmed across Reactome (*MHC class II antigen presentation*, $\text{GeneRatio} \approx 0.031$), five exogenous-antigen and MHC-II assembly terms in GO BP (7–10 genes each, $p_{\text{adj}} \le 0.0125$), and GO MF (*MHC Class II Protein Complex Binding*, \~8 genes; *MHC Class II Receptor Activity*, \~5 genes), driven by locus-wide transcriptional repression of `HLA-DR/DQ/DP` and `CD74`.
+
+#### 4. Artifact Filtering & Secondary Non-Lysosomal Axes
+
+-   **Epithelial context filtering:** In an *in vitro* airway epithelial monoculture, *Neutrophil degranulation* (Reactome) and *Azurophil Granule* (GO CC, \~29 genes) reflect shared endolysosomal and secretory machinery rather than neutrophil biology. Similarly, seven autoimmune and allograft pathways in KEGG (*Asthma*, *Intestinal immune network for IgA production*, *Type I diabetes mellitus*, *Allograft rejection*, *Autoimmune thyroid disease*, *Systemic lupus erythematosus*, and *Graft-versus-host disease*; all $p_{\text{adj}} \le 0.001$), four T-cell signaling hits in Reactome (*ZAP-70*, *CD3/TCR zeta chains*, *PD-1 signaling*, *Generation of second messenger molecules*), and two immunoglobulin terms in GO BP represent annotation echoes triggered by the same downregulated epithelial `HLA-D*` gene block.
+
+-   **Distinct metabolic side axes:** Outside the endomembrane/lysosomal system, two secondary metabolic signatures remain consistently suppressed across databases:
+
+    -   **Lipid and sterol biosynthesis:** Captured by KEGG (*Biosynthesis of unsaturated fatty acids*, \~8 genes), GO BP (*fatty-acyl-CoA Biosynthetic Process*, \~9 genes; *Long-Chain fatty-acyl-CoA Metabolic Process*, \~7 genes), MSigDB Hallmark (*Fatty Acid Metabolism*, 23 genes, $p_{\text{adj}} = 0.017$), and WikiPathways (*Cholesterol metabolism with Bloch and Kandutsch Russell pathways*, 11 genes, $p_{\text{adj}} = 0.030$), which directly interfaces with ER membrane synthesis and lysosomal cholesterol handling (`NPC2`).
+
+    -   **Mitochondrial, amino-acid, and redox homeostasis:** Captured by Reactome (*Mitochondrial protein degradation*, *Phase II - Conjugation of compounds*, and *Glutathione conjugation*), GO MF (*Oxidoreductase Activity, Acting On The CH-OH Group Of Donors*, \~16 genes), KEGG (*Thiamine metabolism*, \~6 genes), and WikiPathways (two redundant *Urea cycle* entries of 7 genes at $p_{\text{adj}} = 0.030$, reflecting shared mitochondrial/cytosolic amino-acid handling rather than hepatic urea synthesis).
+
+Taken together, the FDR-filtered multi-database enrichment profiles demonstrate that H7N9 uniquely destabilizes the host endomembrane system at 24h: by simultaneously suppressing ER–Golgi N-glycosylation, vesicular trafficking, and core lysosomal machinery, the virus impairs intracellular degradation, weakens the secreted epithelial antiprotease barrier, and silences epithelial MHC class II presentation.
+
+### Up-Regulation (H7N9-Exclusive Signature at 24h)
+
+#### 1. Massive Nuclear Transcriptional Reprogramming (and the KEGG HSV-1 Artifact)
+
+-   **Overwhelming transcription factor (TF) signal:** Seven of the top ten FDR-significant GO BP terms ($p_{\text{adj}} \le 0.0035$) capture transcriptional control, led by *Regulation Of DNA-templated Transcription* (\~185 genes) and *Regulation Of Transcription By RNA Polymerase II* (\~185 genes), spanning both *Negative Regulation* (\~88–105 genes) and *Positive Regulation* (\~92 genes).
+
+-   **DNA-binding confirmation:** All ten top GO MF terms ($p_{\text{adj}} < 3 \times 10^{-5}$) directly corroborate this nuclear regulatory shift, highlighting *RNA Polymerase II Transcription Regulatory Region Sequence-Specific DNA Binding* (\~136 genes), *Cis-Regulatory Region Sequence-Specific DNA Binding* (\~122 genes), *DNA Binding* (\~68 genes), and both *DNA-binding Transcription Activator* (\~39 genes) and *Repressor Activity* (\~31 genes).
+
+-   **Strict nuclear localization:** Under FDR filtering ($p_{\text{adj}} < 0.05$), GO CC collapses to just two highly significant broad compartments—*Nucleus* (\~296 genes) and *Intracellular Membrane-Bounded Organelle* (\~316 genes, both $p_{\text{adj}} < 1 \times 10^{-9}$)—confirming that the upregulated signature is overwhelmingly nuclear rather than localized to specific cytoplasmic organelles.
+
+-   **Artifact check (*Herpes simplex virus 1 infection*):** In KEGG, *Herpes simplex virus 1 infection* is the sole pathway surviving multiple-testing correction (\~64 genes, $p_{\text{adj}} = 3.74 \times 10^{-11}$). Rather than indicating herpesvirus biology, this is a well-known KEGG annotation artifact (`hsa05168`): KEGG bundles hundreds of KRAB-domain zinc finger (`ZNF`) transcriptional repressors into the HSV-1 map. Because the H7N9-exclusive upregulated signature is heavily enriched in nuclear DNA-binding repressors, these `ZNF` genes trigger `hsa05168` specifically while sparse TF annotation in KEGG and Reactome leaves all other pathways below statistical significance.
+
+#### 2. Proteostasis Pivot: Activation of the Ubiquitin–Proteasome System (UPS)
+
+-   **Statistically robust UPS enrichment:** Beyond transcriptional regulators, the only other functional axis surviving strict FDR filtering in GO BP is the ubiquitin–proteasome pathway, marked by *Ubiquitin-Dependent Protein Catabolic Process* (\~44 genes), *Protein Ubiquitination* (\~44 genes), and *Proteasomal Protein Catabolic Process* (\~27 genes; all $p_{\text{adj}} \le 0.0035$).
+
+-   **Exclusion of unconfirmed cytoplasmic hits:** Candidate pathways that appeared under unadjusted p-values—most notably *Autophagy*, *MAPK signaling*, and *AMPK signaling* in KEGG, as well as *Autophagosome*, *Vacuolar Membrane*, and chromatin-modifying complexes in GO CC—do not pass `p.adjust < 0.05` against the array background and are therefore excluded from interpretation.
+
+Paired together, the FDR-validated UP and DOWN signatures reveal a sharp compartmental and functional polarity exclusive to H7N9 at 24h: while the virus severely suppresses **cytoplasmic ER–Golgi–lysosomal degradation, secretion, and endolysosomal MHC-II presentation**, the host response pivots sharply toward **nuclear RNA Polymerase II transcriptional remodeling and ubiquitin–proteasome-mediated protein turnover**.
+
+## Lysosomal Analysis
+
+### Kinetics
+
+```{r}
+kegg_lys <- strsplit(
+  enrich_down[["KEGG_2021_Human"]]$Genes[enrich_down[["KEGG_2021_Human"]]$Term == "Lysosome"],
+  ";"
+)[[1]]
+
+modules <- list(
+  "Core Lysosome"     = unique_down_H7N9[toupper(unique_down_H7N9) %in% kegg_lys],
+  "ER-Golgi (N-Glyc)" = strsplit(res_down$geneID[res_down$Description == "Asparagine N-linked glycosylation"], "/")[[1]],
+  "MHC-II Axis"       = strsplit(res_down$geneID[res_down$Description == "MHC class II antigen presentation"], "/")[[1]]
+)
+
+module_map <- bind_rows(lapply(names(modules), function(m) {
+  data.frame(module = m, gene = intersect(unique(modules[[m]]), rownames(data_log)),
+             stringsAsFactors = FALSE)
+}))
+
+expr_long <- as.data.frame(as.table(as.matrix(data_log[unique(module_map$gene), , drop = FALSE])),
+                           stringsAsFactors = FALSE)
+colnames(expr_long) <- c("gene", "SampleID", "expr")
+
+group_means <- expr_long %>%
+  left_join(metadata, by = "SampleID") %>%
+  group_by(gene, Virus, Timepoint) %>%
+  summarise(mean_expr = mean(expr, na.rm = TRUE), .groups = "drop")
+
+mock_means <- group_means %>%
+  filter(Virus == "mock") %>%
+  select(gene, Timepoint, mock_expr = mean_expr)
+
+kin_all <- group_means %>%
+  filter(Virus != "mock") %>%
+  inner_join(mock_means, by = c("gene", "Timepoint")) %>%
+  mutate(
+    log2FC = mean_expr - mock_expr,
+    time   = as.numeric(gsub("[^0-9.]", "", Timepoint))
+  ) %>%
+  inner_join(module_map, by = "gene", relationship = "many-to-many")
+
+virus_cols <- c("H3N2" = "#377EB8", "H7N7" = "#FF7F00",
+                "H7N9" = "#984EA3", "VN1203" = "#4DAF4A")
+
+# Tier 1: Module-level kinetics (mean +/- SE)
+kin_mod <- kin_all %>%
+  group_by(module, Virus, time) %>%
+  summarise(
+    mean_fc = mean(log2FC, na.rm = TRUE),
+    se_fc   = sd(log2FC, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+ggplot(kin_mod, aes(time, mean_fc, color = Virus, fill = Virus, group = Virus)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_ribbon(aes(ymin = mean_fc - se_fc, ymax = mean_fc + se_fc), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.8) +
+  scale_color_manual(values = virus_cols) +
+  scale_fill_manual(values = virus_cols) +
+  scale_x_continuous(breaks = sort(unique(kin_mod$time))) +
+  facet_wrap(~ module, nrow = 1) +
+  theme_bw() +
+  labs(title = "Endomembrane & MHC-II Module Kinetics (H7N9-Exclusive Downregulated Genes)",
+       x = "Hours post-infection", y = "Mean log2FC vs time-matched mock (+/- SE)")
+
+# Tier 2: Top 4 sentinel genes per module ranked by 24h H7N9 downregulation
+top_sentinels <- kin_all %>%
+  filter(Virus == "H7N9", time == max(time)) %>%
+  arrange(log2FC) %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  group_by(module) %>%
+  slice_head(n = 4) %>%
+  ungroup() %>%
+  select(gene, module)
+
+kin_genes <- kin_all %>%
+  semi_join(top_sentinels, by = c("gene", "module")) %>%
+  mutate(gene_label = paste0(gene, "\n(", module, ")"))
+
+ggplot(kin_genes, aes(time, log2FC, color = Virus, group = Virus)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.5) +
+  scale_color_manual(values = virus_cols) +
+  scale_x_continuous(breaks = sort(unique(kin_genes$time))) +
+  facet_wrap(~ gene_label, ncol = 4) +
+  theme_bw() +
+  labs(title = "Sentinel Gene Kinetics Across the ER-Golgi-Lysosome-MHC-II Axis",
+       x = "Hours post-infection", y = "log2 Fold Change vs time-matched mock")
+
+
+# Summary table of genes per module (sorted by 24h H7N9 log2FC)
+module_summary <- kin_all %>%
+  filter(Virus == "H7N9", time == max(time)) %>%
+  arrange(module, log2FC) %>%
+  group_by(module) %>%
+  summarise(
+    N_genes = n(),
+    Genes   = paste(gene, collapse = ", "),
+    .groups = "drop"
+  )
+
+knitr::kable(module_summary, col.names = c("Module", "Count", "H7N9-Exclusive Downregulated Genes (sorted by 24h log2FC)"))
+
+# Inspect genes shared across more than one module
+shared_genes <- module_map %>%
+  group_by(gene) %>%
+  filter(n() > 1) %>%
+  summarise(Modules = paste(module, collapse = " + "), .groups = "drop")
+
+knitr::kable(shared_genes, caption = "Genes Bridging Multiple Endomembrane/MHC-II Modules")
+```
+
+## Statistics on Lysosome, Golgi and MHC-II kinetics
+
+Because candidate modules and sentinel genes were defined from the 24h H7N9-exclusive DEG signature, 24h ANOVA significance is reported descriptively to quantify direct inter-strain separation (Dunnett contrasts vs. H7N9), whereas the 3h–12h tests provide an unbiased evaluation of divergence onset.
+
+```{r}
+#| fig-width: 11
+#| fig-height: 8
+
+kegg_lys <- strsplit(
+  enrich_down[["KEGG_2021_Human"]]$Genes[enrich_down[["KEGG_2021_Human"]]$Term == "Lysosome"],
+  ";"
+)[[1]]
+
+modules <- list(
+  "Core Lysosome"     = unique_down_H7N9[toupper(unique_down_H7N9) %in% kegg_lys],
+  "ER-Golgi (N-Glyc)" = strsplit(res_down$geneID[res_down$Description == "Asparagine N-linked glycosylation"], "/")[[1]],
+  "MHC-II Axis"       = strsplit(res_down$geneID[res_down$Description == "MHC class II antigen presentation"], "/")[[1]]
+)
+
+module_map <- bind_rows(lapply(names(modules), function(m) {
+  data.frame(module = m, gene = intersect(unique(modules[[m]]), rownames(data_log)),
+             stringsAsFactors = FALSE)
+}))
+
+expr_long <- as.data.frame(as.table(as.matrix(data_log[unique(module_map$gene), , drop = FALSE])),
+                           stringsAsFactors = FALSE)
+colnames(expr_long) <- c("gene", "SampleID", "expr")
+
+mock_means <- expr_long %>%
+  left_join(metadata, by = "SampleID") %>%
+  filter(Virus == "mock") %>%
+  group_by(gene, Timepoint) %>%
+  summarise(mock_expr = mean(expr, na.rm = TRUE), .groups = "drop")
+
+kin_rep <- expr_long %>%
+  left_join(metadata, by = "SampleID") %>%
+  filter(Virus != "mock") %>%
+  inner_join(mock_means, by = c("gene", "Timepoint")) %>%
+  mutate(
+    lfc   = expr - mock_expr,
+    time  = as.numeric(gsub("[^0-9.]", "", Timepoint)),
+    Virus = factor(Virus, levels = c("H7N9", "H3N2", "H7N7", "VN1203"))
+  ) %>%
+  inner_join(module_map, by = "gene", relationship = "many-to-many")
+
+kin_all <- kin_rep %>%
+  group_by(gene, Virus, Timepoint, time, module) %>%
+  summarise(log2FC = mean(lfc, na.rm = TRUE), .groups = "drop")
+
+virus_cols <- c("H7N9" = "#984EA3", "H3N2" = "#377EB8",
+                "H7N7" = "#FF7F00", "VN1203" = "#4DAF4A")
+
+run_time_stats <- function(df, id_col) {
+  ids   <- unique(df[[id_col]])
+  times <- sort(unique(df$time))
+  
+  anova_res <- bind_rows(lapply(ids, function(id) {
+    bind_rows(lapply(times, function(t) {
+      dt  <- df[df[[id_col]] == id & df$time == t, ]
+      fit <- aov(lfc ~ Virus, data = dt)
+      s   <- summary(fit)[[1]]
+      rownames(s) <- trimws(rownames(s))
+      data.frame(feature = id, time = t,
+                 F_value = round(s["Virus", "F value"], 1),
+                 p_value = s["Virus", "Pr(>F)"],
+                 stringsAsFactors = FALSE)
+    }))
+  }))
+  
+  anova_res$p_adj  <- p.adjust(anova_res$p_value, method = "BH")
+  anova_res$signif <- as.character(cut(anova_res$p_adj,
+                                       breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+                                       labels = c("***", "**", "*", "ns")))
+  names(anova_res)[1] <- id_col
+  
+  posthoc_res <- bind_rows(lapply(ids, function(id) {
+    bind_rows(lapply(times, function(t) {
+      dt  <- df[df[[id_col]] == id & df$time == t, ]
+      fit <- aov(lfc ~ Virus, data = dt)
+      ct  <- as.data.frame(contrast(emmeans(fit, ~ Virus), method = "trt.vs.ctrl", ref = 1))
+      data.frame(feature = id, time = t, contrast = ct$contrast,
+                 diff_vs_H7N9 = round(ct$estimate, 2),
+                 p_adj = signif(ct$p.value, 3),
+                 stringsAsFactors = FALSE)
+    }))
+  }))
+  names(posthoc_res)[1] <- id_col
+  
+  list(anova = anova_res, posthoc = posthoc_res)
+}
+
+# Intersection-union Dunnett summary: significant only when H7N9 < all 3 other strains
+make_h7n9_stars <- function(stats_obj, id_col) {
+  stats_obj$posthoc %>%
+    group_by(.data[[id_col]], time) %>%
+    summarise(
+      all_lower = all(diff_vs_H7N9 > 0),
+      max_p     = max(p_adj),
+      .groups   = "drop"
+    ) %>%
+    left_join(select(stats_obj$anova, all_of(id_col), time, anova_padj = p_adj),
+              by = c(id_col, "time")) %>%
+    mutate(
+      eff_p  = ifelse(all_lower & anova_padj < 0.05, max_p, 1),
+      signif = as.character(cut(eff_p,
+                                breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+                                labels = c("***", "**", "*", "ns")))
+    )
+}
+
+
+# Tier 1: Module-level kinetics (1 score per biological replicate)
+mod_rep <- kin_rep %>%
+  group_by(module, SampleID, Virus, time) %>%
+  summarise(lfc = mean(lfc, na.rm = TRUE), .groups = "drop")
+
+mod_stats <- run_time_stats(mod_rep, "module")
+mod_h7n9  <- make_h7n9_stars(mod_stats, "module")
+
+mod_sum <- mod_rep %>%
+  group_by(module, Virus, time) %>%
+  summarise(mean_fc = mean(lfc), se_fc = sd(lfc) / sqrt(n()), .groups = "drop")
+
+mod_span <- diff(range(c(mod_sum$mean_fc - mod_sum$se_fc, mod_sum$mean_fc + mod_sum$se_fc)))
+mod_stars <- mod_sum %>%
+  group_by(module) %>%
+  summarise(y_pos = max(mean_fc + se_fc) + 0.08 * mod_span, .groups = "drop") %>%
+  inner_join(mod_h7n9, by = "module")
+
+p_mod <- ggplot(mod_sum, aes(time, mean_fc, color = Virus, group = Virus)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbar(aes(ymin = mean_fc - se_fc, ymax = mean_fc + se_fc), width = 0.8, linewidth = 0.5) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_text(data = mod_stars, aes(time, y_pos, label = signif), inherit.aes = FALSE,
+            size = 4, fontface = "bold") +
+  scale_color_manual(values = virus_cols) +
+  scale_x_continuous(breaks = sort(unique(mod_sum$time))) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.16))) +
+  facet_wrap(~ module, nrow = 1) +
+  theme_bw() +
+  theme(legend.position = "top", legend.title = element_blank(),
+        strip.text = element_text(face = "bold")) +
+  labs(title = "Endomembrane & MHC-II Module Kinetics\n(Dunnett Post-Hoc vs H7N9 per Timepoint)",
+       subtitle = "Mean +/- SEM; stars show Dunnett max(p_adj) where H7N9 < all 3 other strains (*** p < 0.001, ** p < 0.01, * p < 0.05, ns)",
+       x = "Hours post-infection", y = "Module score (mean log2FC vs mock)")
+print(p_mod)
+
+# Tier 2: Sentinel gene kinetics (top 4 per module, grouped by row)
+top_sentinels <- kin_all %>%
+  filter(Virus == "H7N9", time == max(time)) %>%
+  arrange(log2FC) %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  group_by(module) %>%
+  slice_head(n = 4) %>%
+  ungroup() %>%
+  arrange(module, log2FC) %>%
+  mutate(gene_label = factor(paste0(gene, "\n(", module, ")"),
+                             levels = paste0(gene, "\n(", module, ")")))
+
+gene_rep   <- kin_rep %>% semi_join(top_sentinels, by = c("gene", "module"))
+gene_stats <- run_time_stats(gene_rep, "gene")
+gene_h7n9 <- make_h7n9_stars(gene_stats, "gene")
+
+gene_sum <- gene_rep %>%
+  group_by(gene, Virus, time) %>%
+  summarise(mean_fc = mean(lfc), se_fc = sd(lfc) / sqrt(n()), .groups = "drop") %>%
+  left_join(select(top_sentinels, gene, gene_label), by = "gene")
+
+gene_span <- diff(range(c(gene_sum$mean_fc - gene_sum$se_fc, gene_sum$mean_fc + gene_sum$se_fc)))
+gene_stars <- gene_sum %>%
+  group_by(gene, gene_label) %>%
+  summarise(y_pos = max(mean_fc + se_fc) + 0.08 * gene_span, .groups = "drop") %>%
+  inner_join(gene_h7n9, by = "gene")
+
+p_genes <- ggplot(gene_sum, aes(time, mean_fc, color = Virus, group = Virus)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbar(aes(ymin = mean_fc - se_fc, ymax = mean_fc + se_fc), width = 0.8, linewidth = 0.45) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.6) +
+  geom_text(data = gene_stars, aes(time, y_pos, label = signif), inherit.aes = FALSE,
+            size = 3.5, fontface = "bold") +
+  scale_color_manual(values = virus_cols) +
+  scale_x_continuous(breaks = sort(unique(gene_sum$time))) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.16))) +
+  facet_wrap(~ gene_label, ncol = 4) +
+  theme_bw() +
+  theme(legend.position = "top", legend.title = element_blank(),
+        strip.text = element_text(size = 9, face = "bold")) +
+  labs(title = "Sentinel Gene Kinetics Across the ER-Golgi-Lysosome-MHC-II Axis",
+       subtitle = "Mean +/- SEM; stars show Dunnett max(p_adj) where H7N9 < all 3 other strains (*** p < 0.001, ** p < 0.01, * p < 0.05, ns)",
+       x = "Hours post-infection", y = "log2 Fold Change vs time-matched mock")
+print(p_genes)
+
+# Summary & Post-Hoc Tables
+format_wide_signif <- function(df, id_col) {
+  tmp <- as.data.frame(df[order(df$time), c(id_col, "time", "signif")])
+  tmp$time <- paste0(tmp$time, "h")
+  w <- reshape(tmp, idvar = id_col, timevar = "time", direction = "wide")
+  names(w) <- sub("^signif\\.", "", names(w))
+  w
+}
+
+knitr::kable(format_wide_signif(mod_stats$anova, "module"), row.names = FALSE,
+             caption = "Module-Level Global One-Way ANOVA Across Viruses (BH-Adjusted)")
+
+knitr::kable(format_wide_signif(mod_h7n9, "module"), row.names = FALSE,
+             caption = "Module-Level H7N9 Exclusivity Summary (ANOVA-Gated Worst-Case Dunnett p_adj)")
+
+knitr::kable(filter(mod_stats$posthoc, time %in% c(12, 24)), row.names = FALSE,
+             caption = "Module-Level Dunnett Post-Hoc Contrasts vs H7N9 at 12h and 24h (Other - H7N9)")
+
+knitr::kable(format_wide_signif(gene_stats$anova, "gene"), row.names = FALSE,
+             caption = "Sentinel Gene Global One-Way ANOVA Across Viruses (BH-Adjusted across 48 tests)")
+
+knitr::kable(format_wide_signif(gene_h7n9, "gene"), row.names = FALSE,
+             caption = "Sentinel Gene H7N9 Exclusivity Summary (ANOVA-Gated Worst-Case Dunnett p_adj)")
+
+module_summary <- kin_all %>%
+  filter(Virus == "H7N9", time == max(time)) %>%
+  arrange(module, log2FC) %>%
+  group_by(module) %>%
+  summarise(N_genes = n(), Genes = paste(gene, collapse = ", "), .groups = "drop")
+
+knitr::kable(module_summary, col.names = c("Module", "Count", "H7N9-Exclusive Downregulated Genes (sorted by 24h log2FC)"))
+
+shared_genes <- module_map %>%
+  group_by(gene) %>%
+  filter(n() > 1) %>%
+  summarise(Modules = paste(module, collapse = " + "), .groups = "drop")
+
+knitr::kable(shared_genes, caption = "Genes Bridging Multiple Endomembrane/MHC-II Modules")
+
+write.csv(mod_stats$anova,    file.path(output_dir, "module_anova_global.csv"), row.names = FALSE)
+write.csv(gene_stats$anova,   file.path(output_dir, "sentinel_anova_global.csv"), row.names = FALSE)
+write.csv(mod_stats$posthoc,  file.path(output_dir, "module_anova_posthoc.csv"), row.names = FALSE)
+write.csv(gene_stats$posthoc, file.path(output_dir, "sentinel_anova_posthoc.csv"), row.names = FALSE)
+```
+
+Heatmap for Lysosome, Golgi and MHC-II axis gene expression
+
+```{r}
+#| fig-width: 9
+#| fig-height: 11
+
+# Order unique genes by module and 24h H7N9 downregulation
+hm_genes <- kin_all %>%
+  filter(Virus == "H7N9", time == max(time)) %>%
+  group_by(gene) %>%
+  summarise(
+    Module = if (n() > 1) "Shared" else first(module),
+    fc_24h = first(log2FC),
+    .groups = "drop"
+  ) %>%
+  mutate(Module = factor(Module, levels = c("Core Lysosome", "ER-Golgi (N-Glyc)", "MHC-II Axis", "Shared"))) %>%
+  arrange(Module, fc_24h)
+  # Optional: add `%>% filter(gene %in% top_sentinels$gene)` to plot only the 12 sentinels
+
+# Build chronologically ordered log2FC matrix (genes x Virus_Timepoint)
+virus_order <- c("H3N2", "H7N7", "VN1203", "H7N9")
+time_order  <- sort(unique(kin_all$time))
+col_grid    <- expand.grid(time = time_order, Virus = virus_order, stringsAsFactors = FALSE)
+col_grid$col_id <- paste0(col_grid$Virus, "_", col_grid$time, "h")
+
+kin_uniq <- kin_all %>%
+  distinct(gene, Virus, time, .keep_all = TRUE) %>%
+  mutate(col_id = paste0(Virus, "_", time, "h"))
+
+mat_fc <- tapply(kin_uniq$log2FC, list(kin_uniq$gene, kin_uniq$col_id), mean)
+mat_fc <- mat_fc[hm_genes$gene, col_grid$col_id, drop = FALSE]
+
+# Clamp values to [-3, 3] so extreme fold changes saturate cleanly without turning grey
+max_lim <- 3
+mat_plot <- pmax(pmin(mat_fc, max_lim), -max_lim)
+
+# Annotations and visual separators
+ann_col <- data.frame(
+  Virus = factor(col_grid$Virus, levels = virus_order),
+  Time  = factor(paste0(col_grid$time, "h"), levels = paste0(time_order, "h")),
+  row.names = col_grid$col_id
+)
+
+mod_levels <- levels(droplevels(hm_genes$Module))
+ann_row <- data.frame(
+  Module = factor(hm_genes$Module, levels = mod_levels),
+  row.names = hm_genes$gene
+)
+
+mod_palette <- c(
+  "Core Lysosome"     = "#D95F02",
+  "ER-Golgi (N-Glyc)" = "#1B9E77",
+  "MHC-II Axis"       = "#7570B3",
+  "Shared"            = "#E7298A"
+)
+
+ann_colors <- list(
+  Virus  = c(H3N2 = "#377EB8", H7N7 = "#FF7F00", VN1203 = "#4DAF4A", H7N9 = "#984EA3"),
+  Time   = setNames(c("#F0F0F0", "#BDBDBD", "#737373", "#252525"), paste0(time_order, "h")),
+  Module = mod_palette[mod_levels]
+)
+
+col_gaps <- seq(length(time_order), nrow(col_grid) - 1, by = length(time_order))
+row_gaps <- cumsum(table(ann_row$Module))
+row_gaps <- row_gaps[-length(row_gaps)]
+
+pheatmap(
+  mat_plot,
+  cluster_rows      = FALSE,
+  cluster_cols      = FALSE,
+  annotation_col    = ann_col,
+  annotation_row    = ann_row,
+  annotation_colors = ann_colors,
+  gaps_col          = col_gaps,
+  gaps_row          = row_gaps,
+  labels_col        = paste0(col_grid$time, "h"),
+  color             = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100),
+  breaks            = seq(-max_lim, max_lim, length.out = 101),
+  fontsize_row      = 7,
+  fontsize_col      = 8,
+  border_color      = NA,
+  main              = "Temporal Expression of H7N9-Exclusive Endomembrane & MHC-II Modules (log2FC vs Mock)"
+)
+```
+
+## GSEA
+
+```{r}
+library(enrichplot)
+
+make_ranked_entrez <- function(deg_df) {
+  mapped <- bitr(deg_df$Gene, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  df <- deg_df %>%
+    inner_join(mapped, by = c("Gene" = "SYMBOL"), relationship = "many-to-many") %>%
+    filter(!is.na(logFC)) %>%
+    group_by(ENTREZID) %>%
+    slice_max(abs(logFC), n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    arrange(desc(logFC))
+  setNames(df$logFC, df$ENTREZID)
+}
+
+deg_list <- list(H3N2 = deg_H3N2, H7N7 = deg_H7N7, VN1203 = deg_VN1203, H7N9 = deg_H7N9)
+ranks    <- lapply(deg_list, make_ranked_entrez)
+
+set.seed(42)
+gsea_kegg <- lapply(ranks, function(r) {
+  gseKEGG(geneList = r, organism = "hsa", pvalueCutoff = 1, verbose = FALSE)
+})
+
+# Compare KEGG Lysosome (hsa04142) across all 4 viruses without filtering out non-significant strains
+lys_comparison <- bind_rows(lapply(names(gsea_kegg), function(v) {
+  as.data.frame(gsea_kegg[[v]]) %>%
+    filter(ID == "hsa04142") %>%
+    transmute(Virus = v, NES, pvalue, p.adjust, setSize)
+}))
+knitr::kable(lys_comparison, digits = 4, caption = "KEGG Lysosome (hsa04142) GSEA Across Influenza Strains at 24h")
+
+# Classic running-score plot for H7N9 Lysosome
+gseaplot2(gsea_kegg[["H7N9"]], geneSetID = "hsa04142",
+          title = "GSEA: KEGG Lysosome in H7N9 (24h vs Mock)")
+```
+
+```{r}
+set.seed(42)
+gsea_kegg <- lapply(ranks, function(r) {
+  gseKEGG(geneList = r, organism = "hsa", pvalueCutoff = 1, eps = 0, verbose = FALSE)
+})
+
+gsea_react <- lapply(ranks, function(r) {
+  gsePathway(geneList = r, organism = "human", pvalueCutoff = 1, eps = 0, verbose = FALSE)
+})
+
+# Clean 4-virus comparison across all three endomembrane/MHC-II axes
+extract_gsea <- function(gsea_list, term_pattern, col_name = "Description") {
+  bind_rows(lapply(names(gsea_list), function(v) {
+    df <- as.data.frame(gsea_list[[v]])
+    df[grepl(term_pattern, df[[col_name]], ignore.case = TRUE), ] %>%
+      transmute(
+        Pathway  = Description,
+        Virus    = v,
+        NES      = round(NES, 3),
+        pvalue   = formatC(pvalue, format = "e", digits = 2),
+        p.adjust = formatC(p.adjust, format = "e", digits = 2),
+        setSize
+      )
+  }))
+}
+
+gsea_summary <- bind_rows(
+  extract_gsea(gsea_kegg,  "^hsa04142$", col_name = "ID"),
+  extract_gsea(gsea_react, "^Asparagine N-linked glycosylation$|^MHC class II antigen presentation$")
+)
+
+gsea_summary <- gsea_summary %>%
+  mutate(Virus = factor(Virus, levels = c("H3N2", "H7N7", "VN1203", "H7N9"))) %>%
+  arrange(Pathway, Virus)
+
+knitr::kable(gsea_summary, row.names = FALSE,
+             caption = "Cross-Virus GSEA Comparison Across the Endomembrane and MHC-II Axes (24h vs Mock)")
+
+# Multi-pathway running score plot in H7N9 (Reactome)
+react_ids <- as.data.frame(gsea_react[["H7N9"]]) %>%
+  filter(Description %in% c("Asparagine N-linked glycosylation", "MHC class II antigen presentation")) %>%
+  pull(ID)
+
+gseaplot2(gsea_react[["H7N9"]], geneSetID = react_ids,
+          title = "GSEA: ER-Golgi Glycosylation & MHC-II in H7N9 (24h vs Mock)")
+```
+
+String DB ??
